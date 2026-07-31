@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hsmcli"
+version = "0.1.0"
+description = "HackSmarter CLI — manage labs, systems, and VPN from the terminal"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [{name = "hsmcli"}]
+keywords = ["hacksmarter", "cli", "ctf", "security", "labs"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+]
+requires-python = ">=3.8"
+dependencies = [
+    "requests>=2.25.0",
+    "PyYAML>=5.4.0",
+    "rich>=13.0.0",
+]
+
+[project.scripts]
+hsmcli = "hsmcli:main"
+
+[tool.setuptools]
+packages = ["hsmcli"]
