@@ -40,19 +40,22 @@ def _extract_items(payload: Any) -> List[Dict[str, Any]]:
 
 
 def _item_id(item: Dict[str, Any]) -> Optional[str]:
-    """Course ID lookup.
+    """Best-effort id extraction across the many wrapper shapes.
 
-    Catalog entries nest the real course id under ``item.id`` (the outer
-    ``id`` is a catalog-card id that the ``/courses/{id}/…`` endpoints
-    reject). Enrolled entries expose it at the top level. Prefer the nested
-    one when both exist so name-based lookups produce a working id.
+    Catalog entries nest the real course id under ``item.id`` (top-level
+    ``id`` is a catalog-card id the ``/courses/{id}/…`` endpoints reject).
+    Networks-lab status wrappers expose ``course_network_id`` — that's
+    the id the /power endpoint accepts. Systems-lab status wrappers use
+    top-level ``id``. Prefer the most-specific/most-actionable key first.
     """
     nested = item.get("item")
     if isinstance(nested, dict):
         v = nested.get("id")
         if isinstance(v, str) and v:
             return v
-    for k in ("course_id", "system_id", "uuid", "id", "_id"):
+    for k in ("course_network_id", "course_system_id",
+              "course_id", "system_id", "network_id",
+              "uuid", "id", "_id"):
         v = item.get(k)
         if isinstance(v, str) and v:
             return v
@@ -64,9 +67,10 @@ def _item_name(item: Dict[str, Any]) -> str:
         v = item.get(k)
         if isinstance(v, str) and v:
             return v
-    # The systems endpoint nests fields under ``system`` (a sibling of
-    # ``id``); catalog entries nest under ``item``.
-    for wrapper in ("system", "item"):
+    # The status endpoints nest fields under a wrapper key: ``system``
+    # for systems-labs, ``network`` for networks-labs; catalog entries
+    # nest under ``item``.
+    for wrapper in ("system", "network", "item"):
         nested = item.get(wrapper)
         if isinstance(nested, dict):
             for k in ("name", "title"):

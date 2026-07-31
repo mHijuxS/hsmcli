@@ -414,16 +414,13 @@ def cmd_lab_info(api: HackSmarterAPI, config: Config, args) -> int:
                       f"{done}/{len(lessons)}")
         console.print(t)
 
-    # Live systems status — call /take → /systems so we know if it's on.
+    # Live systems / network status — get_lab_systems auto-detects the
+    # lab kind (systems vs networks) and picks the right endpoint / ids.
     try:
-        take = api.get_course_take(course_id)
-        sys_ids = api.extract_system_ids(take)
-        if sys_ids:
-            sys_payload = api.get_lab_systems(course_id, sys_ids)
-            sys_items = _extract_items(sys_payload)
-            if sys_items:
-                _render_systems_table(sys_items,
-                                       title="Systems (live status)")
+        sys_payload = api.get_lab_systems(course_id)
+        sys_items = _flatten_lab_items(_extract_items(sys_payload))
+        if sys_items:
+            _render_systems_table(sys_items, title="Systems (live status)")
     except Exception as e:
         console.print(f"[dim]systems status unavailable: {e}[/dim]")
 
@@ -458,6 +455,33 @@ def cmd_lab_enroll(api: HackSmarterAPI, config: Config, args) -> int:
     if isinstance(data, dict) and data:
         print_json(data)
     return 0
+
+
+def _flatten_lab_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Normalize systems-lab and networks-lab payloads to a flat machine list.
+
+    Networks payload shape:
+        [{course_network_id, network: {name, state, systems: [{id, name,
+         state, ip_address, hostname, ...}]}}]
+    Systems payload shape:
+        [{id, system: {name, state, ip, ...}}]
+
+    For rendering we want a single flat list of "machines" with a common
+    shape. Networks entries expand to their inner ``systems[]``; systems
+    entries pass through unchanged.
+    """
+    out: List[Dict[str, Any]] = []
+    for it in items:
+        net = it.get("network")
+        if isinstance(net, dict) and isinstance(net.get("systems"), list):
+            for s in net["systems"]:
+                if isinstance(s, dict):
+                    # Copy so we can attach the parent-network name for
+                    # multi-network labs — harmless when there's just one.
+                    out.append({**s, "_network": net.get("name")})
+            continue
+        out.append(it)
+    return out
 
 
 def _system_status(item: Dict[str, Any]) -> str:
@@ -512,11 +536,14 @@ def cmd_lab_systems(api: HackSmarterAPI, config: Config, args) -> int:
     fmt = _format_choice(args, config)
     course_id = resolve_course_id(api, args.identifier)
     payload = api.get_lab_systems(course_id)
-    items = _extract_items(payload)
+    # Keep raw for --json (users may want the network wrapper visible);
+    # flatten for the table rendering.
+    raw_items = _extract_items(payload)
+    items = _flatten_lab_items(raw_items)
     if fmt == "json":
-        print_json(items if items else payload); return 0
+        print_json(raw_items if raw_items else payload); return 0
     if fmt == "yaml":
-        print_yaml(items if items else payload); return 0
+        print_yaml(raw_items if raw_items else payload); return 0
     if not items:
         print_warning("No systems returned. Try --json to inspect raw response.")
         return 0
@@ -529,9 +556,10 @@ def cmd_lab_status(api: HackSmarterAPI, config: Config, args) -> int:
     fmt = _format_choice(args, config)
     course_id = resolve_course_id(api, args.identifier)
     payload = api.get_lab_systems(course_id)
-    items = _extract_items(payload)
+    raw_items = _extract_items(payload)
+    items = _flatten_lab_items(raw_items)
     if fmt in ("json", "yaml"):
-        print_output(items if items else payload, fmt); return 0
+        print_output(raw_items if raw_items else payload, fmt); return 0
     if not items:
         print_warning("No systems in this lab.")
         return 0
@@ -555,16 +583,19 @@ def cmd_lab_launch(api: HackSmarterAPI, config: Config, args) -> int:
     if args.system:
         system_id = resolve_system_id(api, course_id, args.system)
     else:
+        # Auto-select from the OUTER wrapper (system_id for systems-labs,
+        # course_network_id for networks-labs) — that's what /power expects.
+        # Do NOT flatten first; the inner machine ids won't work.
         systems = _extract_items(api.get_lab_systems(course_id))
         if len(systems) == 1:
             system_id = _item_id(systems[0]) or ""
-            print_info(f"Auto-selected sole system: {_course_label(systems[0])}")
+            print_info(f"Auto-selected: {_course_label(systems[0])}")
         elif not systems:
-            print_error("Lab has no systems to launch.")
+            print_error("Lab has no systems/networks to launch.")
             return 1
         else:
-            print_error("Lab has multiple systems — specify one:")
-            _render_systems_table(systems)
+            print_error("Lab has multiple targets — specify one:")
+            _render_systems_table(_flatten_lab_items(systems))
             return 1
 
     # Kick a heartbeat before launching so the server treats us as an
@@ -638,14 +669,19 @@ def cmd_lab_launch(api: HackSmarterAPI, config: Config, args) -> int:
 
 
 def _resolve_lab_system(api: HackSmarterAPI, args) -> tuple:
-    """Shared: (course_id, system_id) resolution for stop/reset/etc."""
+    """Shared: (course_id, system_or_network_id) for stop/reset/etc.
+
+    Uses the OUTER wrapper id (system_id / course_network_id) — that's
+    the target of the /power and /reset endpoints. Flattened per-machine
+    ids under a network wrapper are not addressable via /power.
+    """
     course_id = resolve_course_id(api, args.identifier)
     if args.system:
         return course_id, resolve_system_id(api, course_id, args.system)
     systems = _extract_items(api.get_lab_systems(course_id))
     if len(systems) == 1:
         return course_id, _item_id(systems[0]) or ""
-    raise LookupError("multiple or no systems — specify one explicitly")
+    raise LookupError("multiple or no targets — specify one explicitly")
 
 
 def cmd_lab_stop(api: HackSmarterAPI, config: Config, args) -> int:
@@ -670,7 +706,7 @@ def cmd_lab_reset(api: HackSmarterAPI, config: Config, args) -> int:
     try:
         items = _extract_items(api.get_lab_systems(course_id, [system_id]))
         if items:
-            _render_systems_table(items, title="Post-reset status")
+            _render_systems_table(_flatten_lab_items(items), title="Post-reset status")
             new_ip = _system_ip(items[0])
             if new_ip:
                 console.print(f"[green]→ new IP: {new_ip}[/green]")

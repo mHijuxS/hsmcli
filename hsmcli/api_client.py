@@ -215,22 +215,29 @@ class HackSmarterAPI:
     def enroll_course(self, course_id: str) -> Dict[str, Any]:
         return self._request("POST", f"/api/student/courses/{course_id}/enroll")
 
-    # ── lab systems (machines) ────────────────────────────────────────────
+    # ── lab lifecycle (systems + networks) ────────────────────────────────
 
     def _ensure_playthrough(self, course_id: str) -> Dict[str, Any]:
-        """Fetch /take and pull the ids that /systems, /launch, and
-        /heartbeat need.
+        """Fetch /take and pull the ids the lifecycle endpoints need.
 
-        The public course_id (``course.id``) is *not* the id used for launch
-        or status queries. Those use ``course.course_playthrough.id`` — a
-        separate handle created when the user enrolls. The heartbeat also
-        needs the current lesson id (any lesson in the lab works).
+        HackSmarter has TWO lab shapes:
+          * "systems" labs (single VM, e.g. Implicit) — use ``/systems/{id}/*``
+            and ``courseSystemIds=[…]`` for status.
+          * "networks" labs (multi-VM subnet, e.g. NovaForge) — use
+            ``/networks/{id}/*`` and ``content_network_ids=[…]``.
+
+        The public ``course.id`` is *not* the id used for lifecycle ops;
+        those use ``course.course_playthrough.id`` (a handle created on
+        enroll). The heartbeat also needs a lesson id.
+
+        Returns a dict with ``playthrough_id``, ``lesson_id``, ``course_id``,
+        ``customer_id``, ``system_ids``, ``network_ids``, and ``kind``
+        (``"systems"`` | ``"networks"`` | ``"none"``).
         """
         take = self.get_course_take(course_id)
         body = take.get("course", take) if isinstance(take, dict) else {}
         playthrough = body.get("course_playthrough") if isinstance(body, dict) else None
         playthrough_id = (playthrough or {}).get("id")
-        # Grab the first lesson id for heartbeat payloads.
         lesson_id = None
         chapters = body.get("chapters") if isinstance(body, dict) else None
         if isinstance(chapters, list):
@@ -240,65 +247,84 @@ class HackSmarterAPI:
                         lesson_id = les["id"]; break
                 if lesson_id:
                     break
+        system_ids = self.extract_system_ids(take)
+        network_ids = self.extract_network_ids(take)
+        # Prefer networks when the lab has any — a lab may nominally have
+        # both but the browser drives it via /networks in that case.
+        kind = "networks" if network_ids else ("systems" if system_ids else "none")
         return {
             "playthrough_id": playthrough_id,
             "lesson_id": lesson_id,
             "course_id": body.get("id") if isinstance(body, dict) else course_id,
             "customer_id": body.get("customer_id") if isinstance(body, dict) else None,
-            "system_ids": self.extract_system_ids(take),
+            "system_ids": system_ids,
+            "network_ids": network_ids,
+            "kind": kind,
             "take": take,
         }
 
     def get_lab_systems(
         self, course_id: str, system_ids: Optional[List[str]] = None
     ) -> Any:
-        """Systems status endpoint.
+        """Lab live status. Dispatches on lab kind:
 
-        Requires ``courseSystemIds=[<id>,…]`` as a JSON-encoded query param.
-        The path uses ``course_playthrough.id``, not the raw course id —
-        we resolve that via /take.
+        * systems-lab: ``GET /systems?courseSystemIds=[…]``
+        * networks-lab: ``GET /networks?content_network_ids=[…]``
+
+        Callers that pass ``system_ids`` explicitly override auto-discovery
+        (used by /launch --wait polling for a specific target).
         """
         pt = self._ensure_playthrough(course_id)
         playthrough_id = pt["playthrough_id"]
         if not playthrough_id:
             return {"data": [], "note": "no playthrough (enroll first)"}
-        if system_ids is None:
-            system_ids = pt["system_ids"]
-        if not system_ids:
+
+        if pt["kind"] == "networks":
+            ids = system_ids if system_ids is not None else pt["network_ids"]
+            if not ids:
+                return {"data": [], "note": "lab has no networks"}
+            return self._request(
+                "GET",
+                f"/api/student/courses/{playthrough_id}/networks",
+                params={"content_network_ids": json.dumps(ids)},
+            )
+
+        # Default: systems-lab (also covers "none" — endpoint 404s cleanly).
+        ids = system_ids if system_ids is not None else pt["system_ids"]
+        if not ids:
             return {"data": [], "note": "lab has no systems"}
-        params = {"courseSystemIds": json.dumps(system_ids)}
         return self._request(
             "GET",
             f"/api/student/courses/{playthrough_id}/systems",
-            params=params,
+            params={"courseSystemIds": json.dumps(ids)},
         )
 
     def launch_system(self, course_id: str, system_id: str) -> Dict[str, Any]:
-        """Start a lab system.
+        """Start a lab machine / network.
 
-        This is a two-step dance the browser performs:
-          1. ``POST /systems/{id}/launch`` — provisions the system for the
-             playthrough. Response is ``{"success": true}`` even when the
-             machine won't actually boot; on its own it does NOT power it.
-          2. ``POST /systems/{id}/power`` with ``{"action":"on"}`` — turns
-             the VM on. This is the call the "Power → Start" button hits.
+        systems-lab: two-step ``POST /systems/{id}/launch`` (provision) then
+        ``POST /systems/{id}/power`` with ``{"power":"on"}`` (actually
+        boots it — the browser's "Power → Start" hits /power).
+        networks-lab: single ``POST /networks/{id}/power`` with
+        ``{"power":"on"}``.
 
-        Both paths use the playthrough id, not the raw course id. We send
-        an explicit ``Referer: /courses/{course_id}/take`` because the
-        server appears to check it for the power action.
+        We send an explicit ``Referer: /courses/{course_id}/take`` because
+        the server checks it on the power call.
         """
         pt = self._ensure_playthrough(course_id)
         playthrough_id = pt["playthrough_id"] or course_id
         real_course_id = pt["course_id"] or course_id
         take_referer = f"{self.base_url}/courses/{real_course_id}/take"
+        resource = "networks" if pt["kind"] == "networks" else "systems"
+        base = f"/api/student/courses/{playthrough_id}/{resource}/{system_id}"
 
-        base = f"/api/student/courses/{playthrough_id}/systems/{system_id}"
-        # Step 1: provision (idempotent, tolerant of failure once launched).
-        try:
-            self._power_call("POST", base + "/launch", None, take_referer)
-        except Exception:
-            pass
-        # Step 2: power on — this is the one that actually starts the VM.
+        # Provision step exists only for systems-labs; networks-labs go
+        # straight to /power.
+        if resource == "systems":
+            try:
+                self._power_call("POST", base + "/launch", None, take_referer)
+            except Exception:
+                pass
         return self._power_call(
             "POST", base + "/power", {"power": "on"}, take_referer,
         )
@@ -308,22 +334,24 @@ class HackSmarterAPI:
         playthrough_id = pt["playthrough_id"] or course_id
         real_course_id = pt["course_id"] or course_id
         take_referer = f"{self.base_url}/courses/{real_course_id}/take"
+        resource = "networks" if pt["kind"] == "networks" else "systems"
         return self._power_call(
             "POST",
-            f"/api/student/courses/{playthrough_id}/systems/{system_id}/power",
+            f"/api/student/courses/{playthrough_id}/{resource}/{system_id}/power",
             {"power": "off"},
             take_referer,
         )
 
     def reset_system(self, course_id: str, system_id: str) -> Dict[str, Any]:
-        """Reboot the system (POST /systems/{id}/reset with body ``{}``)."""
+        """Reboot the system/network (``POST .../reset`` with body ``{}``)."""
         pt = self._ensure_playthrough(course_id)
         playthrough_id = pt["playthrough_id"] or course_id
         real_course_id = pt["course_id"] or course_id
         take_referer = f"{self.base_url}/courses/{real_course_id}/take"
+        resource = "networks" if pt["kind"] == "networks" else "systems"
         return self._power_call(
             "POST",
-            f"/api/student/courses/{playthrough_id}/systems/{system_id}/reset",
+            f"/api/student/courses/{playthrough_id}/{resource}/{system_id}/reset",
             {},
             take_referer,
         )
@@ -378,17 +406,64 @@ class HackSmarterAPI:
         walk(take_payload)
         return ids
 
+    @staticmethod
+    def extract_network_ids(take_payload: Any) -> List[str]:
+        """Scrape every network UUID from a /take response.
+
+        Networks live at ``course.course_networks[].id`` and
+        ``course.chapters[].lessons[].content.items[].network_id``.
+        """
+        ids: List[str] = []
+        seen: set = set()
+
+        def add(v):
+            if isinstance(v, str) and v and v not in seen:
+                seen.add(v); ids.append(v)
+
+        def walk(node):
+            if isinstance(node, dict):
+                for v in node.values():
+                    walk(v)
+                add(node.get("network_id"))
+                add(node.get("networkId"))
+            elif isinstance(node, list):
+                for x in node:
+                    walk(x)
+
+        # Only pull course_networks[].id — walking the whole tree would
+        # grab unrelated ids that happen to sit under a "network" key.
+        body = take_payload.get("course", take_payload) if isinstance(take_payload, dict) else {}
+        cn = body.get("course_networks") if isinstance(body, dict) else None
+        if isinstance(cn, list):
+            for n in cn:
+                if isinstance(n, dict):
+                    add(n.get("id"))
+        walk(take_payload)
+        return ids
+
     # ── VPN ───────────────────────────────────────────────────────────────
     def get_vpn_config(self, course_id: str, dest_path: Optional[str] = None) -> str:
-        """Download the OpenVPN config for a course.
+        """Download the OpenVPN config for a lab.
+
+        Dispatches on lab kind: systems-labs use
+        ``GET /courses/{playthrough}/vpn`` (course-level), networks-labs
+        use ``GET /courses/{playthrough}/networks/{network}/vpn``.
 
         Returns the file text. Writes it to ``dest_path`` when provided.
-        The endpoint may respond with either ``application/x-openvpn-profile``
-        text or JSON containing a ``config`` field; we handle both.
+        Handles both ``application/x-openvpn-profile`` and JSON responses.
         """
-        r = self._request(
-            "GET", f"/api/student/courses/{course_id}/vpn", raw=True, stream=True,
-        )
+        pt = self._ensure_playthrough(course_id)
+        playthrough_id = pt["playthrough_id"] or course_id
+        if pt["kind"] == "networks":
+            net_ids = pt["network_ids"]
+            if not net_ids:
+                raise Exception("lab has no networks")
+            # Multi-network labs would need explicit selection; for now
+            # take the first — the VPN is usually shared per lab.
+            path = f"/api/student/courses/{playthrough_id}/networks/{net_ids[0]}/vpn"
+        else:
+            path = f"/api/student/courses/{playthrough_id}/vpn"
+        r = self._request("GET", path, raw=True, stream=True)
         content_type = r.headers.get("Content-Type", "")
         if "json" in content_type:
             payload = r.json()
