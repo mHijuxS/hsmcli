@@ -76,14 +76,25 @@ def _item_name(item: Dict[str, Any]) -> str:
     return ""
 
 
+def _normalize(s: str) -> str:
+    """Lowercase and strip anything that isn't a letter or digit.
+
+    Lets 'nova forge' match 'NovaForge', 'sql-basics' match 'SQL Basics',
+    'sysadmins' match 'SysAdmins', etc. — the way humans actually type
+    lab names.
+    """
+    return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+
+
 def resolve_from_list(
     identifier: str, items: List[Dict[str, Any]]
 ) -> Tuple[str, Optional[Dict[str, Any]]]:
     """Resolve ``identifier`` against a list of items.
 
-    Match precedence: exact UUID > exact name (case-insensitive) > unique
-    substring match. Returns ``(id, item)`` or raises ``LookupError`` on
-    ambiguity / no match.
+    Match precedence: exact UUID > exact (normalized) name > unique
+    substring match on the normalized name. Normalization drops spaces
+    and punctuation so 'nova forge' finds 'NovaForge'. Returns
+    ``(id, item)`` or raises ``LookupError`` on ambiguity / no match.
     """
     if not identifier:
         raise LookupError("empty identifier")
@@ -93,8 +104,14 @@ def resolve_from_list(
                 return identifier, it
         return identifier, None  # unknown to us but caller can still use it
 
-    ident_l = identifier.lower()
-    exact = [it for it in items if _item_name(it).lower() == ident_l]
+    ident_n = _normalize(identifier)
+    if not ident_n:
+        raise LookupError(f"identifier '{identifier}' has no alphanumerics")
+
+    # Cache normalized names once — we scan the list several times.
+    normalized = [(it, _normalize(_item_name(it))) for it in items]
+
+    exact = [it for it, n in normalized if n == ident_n]
     if len(exact) == 1:
         return _item_id(exact[0]) or "", exact[0]
     if len(exact) > 1:
@@ -102,7 +119,7 @@ def resolve_from_list(
             f"multiple items exactly named '{identifier}' — use the UUID"
         )
 
-    subs = [it for it in items if ident_l in _item_name(it).lower()]
+    subs = [it for it, n in normalized if ident_n in n]
     if len(subs) == 1:
         return _item_id(subs[0]) or "", subs[0]
     if len(subs) > 1:
