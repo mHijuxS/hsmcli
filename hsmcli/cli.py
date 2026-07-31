@@ -6,11 +6,12 @@ Commands:
     hsmcli config show
     hsmcli whoami
     hsmcli labs list [--search q] [--enrolled]
-    hsmcli lab info <id-or-name>
-    hsmcli lab enroll <id-or-name>
-    hsmcli lab systems <id-or-name>
-    hsmcli lab launch <id-or-name> [<system-id-or-name>]
-    hsmcli lab vpn <id-or-name> [-o file.ovpn]
+    hsmcli lab <id-or-name> info
+    hsmcli lab <id-or-name> enroll
+    hsmcli lab <id-or-name> systems
+    hsmcli lab <id-or-name> launch [<system-id-or-name>] [--no-wait]
+    hsmcli lab <id-or-name> stop | reset
+    hsmcli lab <id-or-name> vpn [-o file.ovpn]
     hsmcli notifications | events | exams | subscriptions | orgs | bundles
 """
 
@@ -581,9 +582,8 @@ def cmd_lab_launch(api: HackSmarterAPI, config: Config, args) -> int:
         print_json(data)
 
     if not args.wait:
-        print_info("Provisioning takes 2–5 min. Poll with "
-                   "`hsmcli lab status " + args.identifier + "` "
-                   "or re-run with --wait.")
+        print_info(f"Provisioning takes 2–5 min. Poll with "
+                   f"`hsmcli lab {args.identifier} status` or drop --no-wait.")
         return 0
 
     # ── wait loop ────────────────────────────────────────────────────────
@@ -632,7 +632,8 @@ def cmd_lab_launch(api: HackSmarterAPI, config: Config, args) -> int:
         time.sleep(3)
 
     console.print(f"[yellow]⚠ timeout after {args.timeout}s — last state: {last_state}[/yellow]")
-    console.print("[dim]The machine may still finish provisioning. Poll with `hsmcli lab status`.[/dim]")
+    console.print(f"[dim]The machine may still finish provisioning. Poll with "
+                  f"`hsmcli lab {args.identifier} status`.[/dim]")
     return 2
 
 
@@ -758,9 +759,17 @@ def build_parser() -> argparse.ArgumentParser:
                      default=None, help="sort results")
     _add_format_flags(_ll)
 
-    # lab (single)
-    pl = sp.add_parser("lab", help="operations on a single lab")
-    lsub2 = pl.add_subparsers(dest="subcommand")
+    # lab (single) — usage: hsmcli lab <identifier> <action> [args…]
+    # Putting the identifier BEFORE the action reads naturally ("lab
+    # implicit launch", "lab implicit reset") and lets shell history/^r
+    # target a specific lab across actions.
+    pl = sp.add_parser(
+        "lab",
+        help="operations on a single lab (usage: lab <identifier> <action>)",
+    )
+    pl.add_argument("identifier", help="course UUID or (unique) name substring")
+    lsub2 = pl.add_subparsers(dest="subcommand", required=True,
+                              metavar="ACTION")
     for name, help_text in [
         ("info", "show lab metadata (with live system status)"),
         ("take", "show take/enroll info"),
@@ -768,34 +777,29 @@ def build_parser() -> argparse.ArgumentParser:
         ("systems", "list systems (machines) in the lab with live status"),
         ("status", "quick 'is it on?' summary of the lab"),
     ]:
-        sub = lsub2.add_parser(name, help=help_text)
-        sub.add_argument("identifier", help="course UUID or (unique) name substring")
-        _add_format_flags(sub)
+        _add_format_flags(lsub2.add_parser(name, help=help_text))
 
     _lch = lsub2.add_parser("launch", help="launch (start) a system in the lab")
-    _lch.add_argument("identifier", help="course UUID or name substring")
     _lch.add_argument("system", nargs="?",
                       help="system UUID or name (optional if lab has only one)")
-    _lch.add_argument("-w", "--wait", action="store_true",
-                      help="poll status (sending heartbeats) until the system is up")
+    _lch.add_argument("--no-wait", dest="wait", action="store_false",
+                      default=True,
+                      help="don't poll after launch — return as soon as /power ACKs")
     _lch.add_argument("--timeout", type=int, default=420,
-                      help="max seconds to wait when --wait is set (default 420 = 7 min)")
+                      help="max seconds to wait when polling (default 420 = 7 min)")
     _add_format_flags(_lch)
 
     _lst = lsub2.add_parser("stop", help="power off a running system in the lab")
-    _lst.add_argument("identifier", help="course UUID or name substring")
     _lst.add_argument("system", nargs="?",
                       help="system UUID or name (optional if lab has only one)")
     _add_format_flags(_lst)
 
     _lrs = lsub2.add_parser("reset", help="reboot (reset) a running system in the lab")
-    _lrs.add_argument("identifier", help="course UUID or name substring")
     _lrs.add_argument("system", nargs="?",
                       help="system UUID or name (optional if lab has only one)")
     _add_format_flags(_lrs)
 
     _lvpn = lsub2.add_parser("vpn", help="download the OpenVPN config for the lab")
-    _lvpn.add_argument("identifier", help="course UUID or name substring")
     _lvpn.add_argument("-o", "--output", help="output file (default ./hsm-<id>.ovpn)")
     _lvpn.add_argument("--print", action="store_true", help="also print config to stdout")
 
@@ -944,7 +948,7 @@ def main() -> int:
                     header.append(str(v), style="cyan")
             console.print(Panel(header, border_style="cyan", padding=(0, 2)))
             console.print("[dim]This is the top-up balance. Your subscription's monthly "
-                          "runtime allowance is shown per-lab (see `hsmcli lab info <name>` "
+                          "runtime allowance is shown per-lab (see `hsmcli lab <name> info` "
                           "→ runtime).[/dim]")
             return 0
     except LookupError as e:

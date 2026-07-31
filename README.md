@@ -49,18 +49,19 @@ hsmcli labs list -c challenge -c range  # category filter (challenge/guided/rang
 hsmcli labs list -s "active directory"  # substring filter on name/description
 hsmcli labs list --sort difficulty      # sort by name | difficulty | state
 
-# One lab
-hsmcli lab info    <name>               # rich card + chapters + live systems
-hsmcli lab take    <name>               # raw /take payload
-hsmcli lab enroll  <name>               # POST /enroll
-hsmcli lab systems <name>               # live status of all systems
-hsmcli lab status  <name>               # compact "is it on?" summary
+# One lab — identifier comes first, then the action
+hsmcli lab <name> info                  # rich card + chapters + live systems
+hsmcli lab <name> take                  # raw /take payload
+hsmcli lab <name> enroll                # POST /enroll
+hsmcli lab <name> systems               # live status of all systems
+hsmcli lab <name> status                # compact "is it on?" summary
 
 # Lifecycle
-hsmcli lab launch <name> [--wait]       # /launch + /power on (heartbeat + poll if --wait)
-hsmcli lab stop   <name>                # /power off
-hsmcli lab reset  <name>                # /reset (new IP assigned)
-hsmcli lab vpn    <name> -o me.ovpn     # download OpenVPN config
+hsmcli lab <name> launch                # /launch + /power on, then poll until running (default)
+hsmcli lab <name> launch --no-wait      # return immediately after /power ACKs
+hsmcli lab <name> stop                  # /power off
+hsmcli lab <name> reset                 # /reset (new IP assigned)
+hsmcli lab <name> vpn -o me.ovpn        # download OpenVPN config
 
 # Account
 hsmcli whoami
@@ -81,9 +82,9 @@ Labs and systems accept either a UUID or a case-insensitive substring of
 the name. Ambiguous matches list the candidates and exit non-zero:
 
 ```bash
-hsmcli lab info implicit                     # matches "Challenge Lab: Implicit (Easy)"
-hsmcli lab launch "Odyssey"                  # multi-word ok
-hsmcli lab info 37e66768-0973-4a1b-9ae6-…    # UUID always works
+hsmcli lab implicit info                     # matches "Challenge Lab: Implicit (Easy)"
+hsmcli lab "Odyssey" launch                  # multi-word ok
+hsmcli lab 37e66768-0973-4a1b-9ae6-… info    # UUID always works
 ```
 
 ## Endpoint map
