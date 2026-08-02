@@ -715,6 +715,146 @@ def cmd_lab_reset(api: HackSmarterAPI, config: Config, args) -> int:
     return 0
 
 
+QUESTION_STATE_STYLE = {
+    "correct": "green",
+    "incorrect": "red",
+    "attempted": "yellow",
+    "not_attempted": "dim",
+}
+
+
+def _render_flags_table(items: List[Dict[str, Any]], title: str = "Flags / questions"):
+    t = Table(title=title, show_header=True,
+              header_style="bold", border_style="dim")
+    t.add_column("#", justify="right", style="dim")
+    t.add_column("Prompt")
+    t.add_column("State")
+    t.add_column("Pts", justify="right")
+    t.add_column("Match", style="dim")
+    t.add_column("Hint", justify="center", style="dim")
+    for i, q in enumerate(items, 1):
+        t.add_row(
+            str(i),
+            truncate(q.get("prompt") or "?", 60),
+            _badge(q.get("state") or "not_attempted", QUESTION_STATE_STYLE),
+            str(q.get("points") or "—"),
+            str(q.get("match_type") or "—"),
+            "✓" if q.get("has_hint") else "",
+        )
+    console.print(t)
+
+
+def cmd_lab_flags(api: HackSmarterAPI, config: Config, args) -> int:
+    fmt = _format_choice(args, config)
+    course_id = resolve_course_id(api, args.identifier)
+    take = api.get_course_take(course_id)
+    questions = api.extract_questions(take)
+    if fmt == "json":
+        print_json(questions); return 0
+    if fmt == "yaml":
+        print_yaml(questions); return 0
+    if not questions:
+        print_warning("No questions/flags in this lab's /take payload.")
+        return 0
+    _render_flags_table(questions)
+    total_pts = sum(int(q.get("points") or 0) for q in questions)
+    got_pts = sum(int(q.get("points") or 0) for q in questions
+                  if (q.get("state") or "").lower() == "correct")
+    print()
+    print_info(f"{got_pts}/{total_pts} points earned across {len(questions)} question(s)")
+    return 0
+
+
+def _match_question(
+    questions: List[Dict[str, Any]], selector: str
+) -> Dict[str, Any]:
+    """Pick a question by keyword / 1-based index / UUID / prompt substring.
+
+    ``user``/``root`` are treated as prompt substrings — the vast majority
+    of HSM labs have exactly one question mentioning each. Ambiguity or no
+    match raises ``LookupError``.
+    """
+    if not questions:
+        raise LookupError("lab has no questions/flags")
+
+    # 1-based index.
+    if selector.isdigit():
+        idx = int(selector)
+        if 1 <= idx <= len(questions):
+            return questions[idx - 1]
+        raise LookupError(f"index {idx} out of range (1..{len(questions)})")
+
+    # Exact UUID → question_id.
+    if is_uuid(selector):
+        for q in questions:
+            if q.get("question_id") == selector:
+                return q
+        raise LookupError(f"no question with id {selector}")
+
+    # Case-insensitive prompt substring. ``user``/``root`` land here.
+    needle = selector.lower()
+    matches = [q for q in questions
+               if needle in (q.get("prompt") or "").lower()]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        prompts = "; ".join(truncate(q.get("prompt") or "?", 40) for q in matches)
+        raise LookupError(f"ambiguous '{selector}' — matches: {prompts}")
+    raise LookupError(f"no question matching '{selector}'")
+
+
+def cmd_lab_submit(api: HackSmarterAPI, config: Config, args) -> int:
+    fmt = _format_choice(args, config)
+    course_id = resolve_course_id(api, args.identifier)
+    take = api.get_course_take(course_id)
+    questions = api.extract_questions(take)
+    try:
+        q = _match_question(questions, args.selector)
+    except LookupError as e:
+        print_error(str(e))
+        if questions:
+            print_info("Available questions:")
+            _render_flags_table(questions)
+        return 2
+
+    if (q.get("state") or "").lower() == "correct" and not args.force:
+        print_warning(
+            f"Question already marked correct "
+            f"(previous submission: {q.get('last_submission')}). "
+            f"Pass --force to resubmit anyway."
+        )
+        return 0
+
+    data = api.submit_question(
+        course_id=course_id,
+        content_id=q["content_id"],
+        lesson_id=q["lesson_id"],
+        question_id=q["question_id"],
+        submission=args.value,
+    )
+
+    if fmt in ("json", "yaml"):
+        print_output(data, fmt); return 0
+
+    correct = bool(data.get("correct")) if isinstance(data, dict) else False
+    prompt_short = truncate(q.get("prompt") or "?", 60)
+    if correct:
+        print_success(f"✓ correct — {prompt_short}  ({q.get('points') or '?'} pts)")
+        matched = (data.get("matchedAnswer") or {}) if isinstance(data, dict) else {}
+        answer = matched.get("answer") if isinstance(matched, dict) else None
+        if answer and answer != args.value:
+            print_info(f"server-accepted answer: {answer}")
+    else:
+        print_error(f"✗ incorrect — {prompt_short}")
+        if isinstance(data, dict):
+            # Server sometimes echoes hints or attempt counters.
+            for k in ("hint", "attempts_remaining", "message"):
+                v = data.get(k)
+                if v:
+                    print_info(f"  {k}: {v}")
+    return 0 if correct else 1
+
+
 def cmd_lab_vpn(api: HackSmarterAPI, config: Config, args) -> int:
     course_id = resolve_course_id(api, args.identifier)
     dest = args.output
@@ -839,6 +979,17 @@ def build_parser() -> argparse.ArgumentParser:
     _lvpn.add_argument("-o", "--output", help="output file (default ./hsm-<id>.ovpn)")
     _lvpn.add_argument("--print", action="store_true", help="also print config to stdout")
 
+    _lfl = lsub2.add_parser("flags", help="list flags / questions in the lab")
+    _add_format_flags(_lfl)
+
+    _lsb = lsub2.add_parser("submit", help="submit a flag / free-text answer")
+    _lsb.add_argument("selector",
+                      help="'user' | 'root' | 1-based index | question UUID | prompt substring")
+    _lsb.add_argument("value", help="flag / answer to submit")
+    _lsb.add_argument("--force", action="store_true",
+                      help="resubmit even if the question is already correct")
+    _add_format_flags(_lsb)
+
     # standalone misc commands
     for name, help_text in [
         ("notifications", "list notifications"),
@@ -916,6 +1067,8 @@ def main() -> int:
                 "stop": cmd_lab_stop,
                 "reset": cmd_lab_reset,
                 "vpn": cmd_lab_vpn,
+                "flags": cmd_lab_flags,
+                "submit": cmd_lab_submit,
             }
             fn = table.get(args.subcommand)
             if not fn:

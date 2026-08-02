@@ -490,6 +490,86 @@ class HackSmarterAPI:
             "GET", f"/api/student/content/{content_id}/jupyter/files",
         )
 
+    def submit_question(
+        self,
+        course_id: str,
+        content_id: str,
+        lesson_id: str,
+        question_id: str,
+        submission: str,
+    ) -> Dict[str, Any]:
+        """Submit a flag / free-text answer to a lesson question.
+
+        Endpoint: ``POST /api/student/content/{content_id}/lessons/{lesson_id}
+        /submit-question`` with body ``{questionId, submission}``. The server
+        checks the ``Referer`` against ``/courses/{course_id}/take``.
+
+        Returns the server's verdict payload (typically
+        ``{correct, matchedAnswer, …}``).
+        """
+        pt = self._ensure_playthrough(course_id)
+        real_course_id = pt["course_id"] or course_id
+        take_referer = f"{self.base_url}/courses/{real_course_id}/take"
+        return self._power_call(
+            "POST",
+            f"/api/student/content/{content_id}/lessons/{lesson_id}/submit-question",
+            {"questionId": question_id, "submission": submission},
+            take_referer,
+        )
+
+    @staticmethod
+    def extract_questions(take_payload: Any) -> List[Dict[str, Any]]:
+        """Enumerate every question item in a /take payload.
+
+        Questions live at
+        ``course.chapters[].lessons[].content.items[]`` where ``type``
+        starts with ``question-`` (e.g. ``question-free-text``). We yield
+        the fields callers need to submit and render — ``content_id`` and
+        ``lesson_id`` come from the enclosing lesson wrapper, not the item.
+        """
+        body = (
+            take_payload.get("course", take_payload)
+            if isinstance(take_payload, dict) else {}
+        )
+        out: List[Dict[str, Any]] = []
+        for ch in (body.get("chapters") or []):
+            if not isinstance(ch, dict):
+                continue
+            for les in (ch.get("lessons") or []):
+                if not isinstance(les, dict):
+                    continue
+                content = les.get("content") or {}
+                content_id = content.get("id") if isinstance(content, dict) else None
+                lesson_id = les.get("id")
+                items = content.get("items") if isinstance(content, dict) else None
+                if not isinstance(items, list):
+                    continue
+                for it in items:
+                    if not isinstance(it, dict):
+                        continue
+                    t = it.get("type") or ""
+                    if not str(t).startswith("question"):
+                        continue
+                    attempt = it.get("attempt") or {}
+                    result = attempt.get("result") or {}
+                    out.append({
+                        "content_id": content_id,
+                        "lesson_id": lesson_id,
+                        "chapter": ch.get("name"),
+                        "lesson": les.get("name"),
+                        "question_id": it.get("id"),
+                        "type": t,
+                        "prompt": (it.get("question") or "").strip(),
+                        "match_type": it.get("match_type"),
+                        "points": it.get("points"),
+                        "state": it.get("state"),
+                        "has_hint": bool(it.get("hasHint")),
+                        "hint": it.get("hint"),
+                        "last_submission": attempt.get("submission"),
+                        "last_correct": result.get("correct"),
+                    })
+        return out
+
     def get_credits(self, credit_id: str) -> Any:
         return self._request("GET", f"/api/student/credits/{credit_id}")
 
