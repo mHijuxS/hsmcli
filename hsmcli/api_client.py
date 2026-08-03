@@ -22,6 +22,10 @@ import requests
 AUTH_COOKIE_BASE = "sb-auth-auth-token"
 COOKIE_DOMAIN = ".hacksmarter.org"
 
+# Lab/course thumbnails live on a separate CloudFront-backed CDN, keyed by
+# the course's `image_path` field — public, no auth/cookies required.
+IMAGE_BASE_URL = "https://images.coursestack.com"
+
 
 def parse_cookie_header(raw: str) -> Dict[str, str]:
     """Parse a browser ``Cookie:`` header into ``{name: value}``.
@@ -159,6 +163,15 @@ class HackSmarterAPI:
                     "Update it with: hsmcli config set-cookie '<paste cookie header>' "
                     "or export HSMCLI_COOKIE."
                 )
+            if code == 403:
+                # The API returns a bare {"error":"forbidden"} for both
+                # "not enrolled yet" and genuine permission issues — the
+                # former is by far the common case (owned/free labs still
+                # need an explicit /enroll before /take or system-status
+                # endpoints serve data), so point at it directly.
+                m = re.search(r"/courses/([0-9a-fA-F-]{36})", endpoint)
+                hint = f" Not enrolled? Try: hsmcli lab {m.group(1)} enroll" if m else ""
+                raise Exception(f"HTTP 403 (forbidden) on {method_up} {endpoint}: {body}.{hint}")
             raise Exception(f"HTTP {code} on {method_up} {endpoint}: {body}")
         except requests.exceptions.RequestException as e:
             raise Exception(f"Request failed: {e}")
@@ -208,6 +221,27 @@ class HackSmarterAPI:
 
     def get_course(self, course_id: str) -> Dict[str, Any]:
         return self._request("GET", f"/api/student/courses/{course_id}")
+
+    @staticmethod
+    def image_url(image_path: str) -> str:
+        """Build the public thumbnail URL for a course's ``image_path``."""
+        return f"{IMAGE_BASE_URL}/{image_path.lstrip('/')}"
+
+    def download_lab_image(self, image_path: str, dest_path: Optional[str] = None) -> bytes:
+        """Fetch a lab's thumbnail from the images CDN.
+
+        Public CloudFront/S3 asset — no auth, and not under ``base_url``,
+        so this bypasses ``_request`` and hits ``IMAGE_BASE_URL`` directly.
+        Returns the raw bytes; writes them to ``dest_path`` when provided.
+        """
+        url = self.image_url(image_path)
+        r = requests.get(url, stream=True)
+        r.raise_for_status()
+        content = r.content
+        if dest_path:
+            with open(dest_path, "wb") as f:
+                f.write(content)
+        return content
 
     def get_course_take(self, course_id: str) -> Dict[str, Any]:
         return self._request("GET", f"/api/student/courses/{course_id}/take")

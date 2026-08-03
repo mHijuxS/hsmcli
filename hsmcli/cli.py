@@ -21,6 +21,7 @@ import sys
 from typing import Any, Dict, List, Optional
 
 from rich.console import Console
+from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -383,18 +384,25 @@ def cmd_lab_info(api: HackSmarterAPI, config: Config, args) -> int:
         hrs = int(runtime) / 3600
         meta.append(f"   runtime: {int(hrs):,}h·GB", style="dim")
 
+    lines = [header, "\n", meta]
+    image_path = body.get("image_path")
+    if image_path:
+        lines += ["\n", Text(f"image: {api.image_url(image_path)}", style="dim")]
+
     console.print()
-    console.print(Panel(Text.assemble(header, "\n", meta),
+    console.print(Panel(Text.assemble(*lines),
                         border_style="cyan", padding=(0, 2)))
 
-    # Description (prefer plain, fall back to markdown truncated)
-    desc = body.get("description") or body.get("description_markdown") or ""
-    if desc:
-        # Show up to ~600 chars of description in a panel
-        snippet = desc.strip()
-        if len(snippet) > 600:
-            snippet = snippet[:600].rstrip() + "…"
-        console.print(Panel(snippet, title="Description",
+    # Description — description_markdown carries the real briefing
+    # (objective/scope, author, initial access); the plain `description`
+    # field is just a one-line blurb. Prefer the markdown one when present.
+    desc_md = body.get("description_markdown") or ""
+    desc_plain = body.get("description") or ""
+    if desc_md:
+        console.print(Panel(Markdown(desc_md.strip()), title="Description",
+                            border_style="dim", padding=(0, 2)))
+    elif desc_plain:
+        console.print(Panel(desc_plain.strip(), title="Description",
                             border_style="dim", padding=(0, 2)))
 
     # Chapters / lessons — most useful bit for a lab writeup
@@ -868,6 +876,36 @@ def cmd_lab_vpn(api: HackSmarterAPI, config: Config, args) -> int:
     return 0
 
 
+def _guess_image_ext(data: bytes) -> str:
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return ".png"
+    if data[:3] == b"\xff\xd8\xff":
+        return ".jpg"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return ".gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    return ".bin"
+
+
+def cmd_lab_image(api: HackSmarterAPI, config: Config, args) -> int:
+    course_id = resolve_course_id(api, args.identifier)
+    body = _unwrap_course(api.get_course(course_id))
+    image_path = body.get("image_path")
+    if not image_path:
+        print_warning("This lab has no image_path set.")
+        return 0
+    if args.url_only:
+        print(api.image_url(image_path))
+        return 0
+    data = api.download_lab_image(image_path)
+    dest = args.output or f"hsm-{course_id}{_guess_image_ext(data)}"
+    with open(dest, "wb") as f:
+        f.write(data)
+    print_success(f"Image written to {dest} ({len(data)} bytes)")
+    return 0
+
+
 # ── misc ──────────────────────────────────────────────────────────────────
 
 def _simple_get(api_fn, args, config: Config) -> int:
@@ -979,6 +1017,11 @@ def build_parser() -> argparse.ArgumentParser:
     _lvpn.add_argument("-o", "--output", help="output file (default ./hsm-<id>.ovpn)")
     _lvpn.add_argument("--print", action="store_true", help="also print config to stdout")
 
+    _limg = lsub2.add_parser("image", help="download the lab's thumbnail image")
+    _limg.add_argument("-o", "--output", help="output file (default ./hsm-<id>.<ext>)")
+    _limg.add_argument("--url-only", action="store_true",
+                       help="just print the image URL, don't download")
+
     _lfl = lsub2.add_parser("flags", help="list flags / questions in the lab")
     _add_format_flags(_lfl)
 
@@ -1067,6 +1110,7 @@ def main() -> int:
                 "stop": cmd_lab_stop,
                 "reset": cmd_lab_reset,
                 "vpn": cmd_lab_vpn,
+                "image": cmd_lab_image,
                 "flags": cmd_lab_flags,
                 "submit": cmd_lab_submit,
             }

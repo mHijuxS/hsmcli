@@ -62,6 +62,7 @@ hsmcli lab <name> launch --no-wait      # return immediately after /power ACKs
 hsmcli lab <name> stop                  # /power off
 hsmcli lab <name> reset                 # /reset (new IP assigned)
 hsmcli lab <name> vpn -o me.ovpn        # download OpenVPN config
+hsmcli lab <name> image                 # download the lab thumbnail (--url-only to just print the URL)
 
 # Account
 hsmcli whoami
@@ -102,6 +103,7 @@ hsmcli lab 37e66768-0973-4a1b-9ae6-… info    # UUID always works
 | `lab stop` | POST | `.../systems/{sys}/power` | `{"power":"off"}` |
 | `lab reset` | POST | `.../systems/{sys}/reset` | `{}` |
 | `lab vpn` | GET | `/api/student/courses/{playthrough}/vpn` | — |
+| `lab image` | GET | `https://images.coursestack.com/{image_path}` | — |
 | `credits` | GET | `/api/student/credits/{customer_id}` | — |
 | `heartbeat` | POST | `/api/heartbeat` | `{lessonId, courseId, coursePlaythroughId}` |
 | `subscriptions` | GET | `/api/student/subscriptions` | — |
