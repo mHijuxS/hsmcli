@@ -1516,7 +1516,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="HackSmarter CLI — manage labs, systems, and VPN from the terminal.",
     )
     p.add_argument("--debug", action="store_true",
-                   help="print raw JSON of every API response and exit")
+                   help="trace every API request/response to stderr")
     p.add_argument("--config-dir", help="override config directory (default ~/.hsmcli)")
     sp = p.add_subparsers(dest="command")
 
@@ -1762,7 +1762,11 @@ def main() -> int:
         if args.command == "heartbeat":
             fmt = _format_choice(args, config)
             if getattr(args, "identifier", None):
-                data = api.heartbeat_for_course(args.identifier)
+                # Resolve first: every other command does, and passing a name
+                # straight through made `heartbeat <name>` 400 with
+                # "Invalid uuid" — despite the README documenting a name.
+                data = api.heartbeat_for_course(
+                    resolve_course_id(api, args.identifier))
             else:
                 data = api.heartbeat()
             print_output(data, fmt)

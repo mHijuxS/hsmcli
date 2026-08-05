@@ -1,0 +1,54 @@
+name: ci
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # The matrix is what makes `requires-python` an actual claim rather than
+    # a guess — 3.9 is the declared floor, so it gets tested.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install --upgrade pip
+      - run: pip install -e '.[dev]'
+      - run: pytest -q
+      # The tests never touch the network, but a stray requests call in a
+      # future test would hang CI rather than fail it. Catch import-time
+      # regressions in the CLI surface too.
+      - run: hsmcli --help
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - run: pip install build twine
+      - run: python -m build
+      # Fails if the README won't render on PyPI or the LICENSE went missing
+      # from dist-info again.
+      - run: twine check dist/*
+      - run: |
+          python - <<'EOF'
+          import glob, zipfile, sys
+          whl = glob.glob("dist/*.whl")[0]
+          names = zipfile.ZipFile(whl).namelist()
+          if not any("licenses/LICENSE" in n for n in names):
+              sys.exit(f"LICENSE missing from {whl}")
+          print("LICENSE present in wheel")
+          EOF

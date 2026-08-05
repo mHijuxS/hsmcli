@@ -22,6 +22,31 @@ import requests
 AUTH_COOKIE_BASE = "sb-auth-auth-token"
 COOKIE_DOMAIN = ".hacksmarter.org"
 
+# Identify ourselves honestly. This started life as a Firefox string on the
+# assumption the edge filtered unknown clients; it doesn't — /profile,
+# /catalog, /courses, /courses/{id}, /take, /subscriptions, /exams/owned and
+# POST /heartbeat all answer identically with no UA, with
+# "python-requests/…", and with the string below. The server's actual
+# same-origin check is the Referer header, which _power_call sets.
+#
+# BROWSER_USER_AGENT is kept as a documented fallback: if HackSmarter ever
+# does start filtering, `HSMCLI_USER_AGENT="$(…)"` is a one-line fix rather
+# than a patch.
+BROWSER_USER_AGENT = ("Mozilla/5.0 (X11; Linux x86_64; rv:128.0) "
+                      "Gecko/20100101 Firefox/128.0")
+
+
+def client_version() -> str:
+    try:
+        from importlib.metadata import version
+        return version("hsmcli")
+    except Exception:  # not installed (running from a checkout)
+        return "dev"
+
+
+DEFAULT_USER_AGENT = (f"hsmcli/{client_version()} "
+                      f"(+https://github.com/mHijuxS/hsmcli)")
+
 # Lab/course thumbnails live on a separate CloudFront-backed CDN, keyed by
 # the course's `image_path` field — public, no auth/cookies required.
 IMAGE_BASE_URL = "https://images.coursestack.com"
@@ -139,9 +164,9 @@ class HackSmarterAPI:
         self.session = requests.Session()
 
         self.session.headers.update({
-            # Match a normal browser so the edge / WAF doesn't second-guess us.
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) "
-                          "Gecko/20100101 Firefox/128.0",
+            # See DEFAULT_USER_AGENT: we name ourselves rather than pose as a
+            # browser. HSMCLI_USER_AGENT overrides it.
+            "User-Agent": os.getenv("HSMCLI_USER_AGENT") or DEFAULT_USER_AGENT,
             "Accept": "application/json, text/plain, */*",
             "Accept-Language": "en-US,en;q=0.5",
             "Origin": self.base_url,
@@ -160,6 +185,27 @@ class HackSmarterAPI:
                 self._session_data = decode_supabase_session(parsed)
 
     # ── low-level ─────────────────────────────────────────────────────────
+    def _trace(self, method: str, endpoint: str, response: Any,
+               payload: Any = None, body: Optional[str] = None) -> None:
+        """Print one request/response to stderr when ``--debug`` is on.
+
+        stderr, not stdout, so a debug run can still be piped: ``--debug
+        --json`` used to interleave the trace into the JSON. And this
+        returns instead of exiting, so a command that makes several calls
+        traces all of them — ``labs list`` reads two endpoints and
+        ``lab info`` reads three, and the old ``sys.exit(0)`` after the
+        first one hid the rest.
+        """
+        if not self.debug:
+            return
+        status = getattr(response, "status_code", "?")
+        print(f"── {method} {endpoint} → {status}", file=sys.stderr)
+        if body is not None:
+            print(body, file=sys.stderr)
+        else:
+            print(json.dumps(payload, indent=2, ensure_ascii=False,
+                             default=str), file=sys.stderr)
+
     def _request(
         self,
         method: str,
@@ -191,16 +237,17 @@ class HackSmarterAPI:
                 raise ValueError(f"Unsupported HTTP method: {method}")
             r.raise_for_status()
             if raw:
+                self._trace(method_up, endpoint, r, body="<raw response>")
                 return r
             if not r.content:
+                self._trace(method_up, endpoint, r, payload={})
                 return {}
             try:
                 out = r.json()
             except ValueError:
+                self._trace(method_up, endpoint, r, body=r.text)
                 return {"raw": r.text}
-            if self.debug:
-                print(json.dumps(out, indent=2, ensure_ascii=False, default=str))
-                sys.exit(0)
+            self._trace(method_up, endpoint, r, payload=out)
             return out
         except requests.exceptions.HTTPError as e:
             code = e.response.status_code if e.response is not None else "?"
@@ -478,12 +525,18 @@ class HackSmarterAPI:
         else:
             r = self.session.request(method, url, json=body, headers=headers)
         r.raise_for_status()
+        # Power/submit calls bypass _request (they need a per-call Referer),
+        # so trace them here too or --debug would miss every lifecycle op.
         if not r.content:
+            self._trace(method.upper(), path, r, payload={"success": True})
             return {"success": True}
         try:
-            return r.json()
+            out = r.json()
         except ValueError:
+            self._trace(method.upper(), path, r, body=r.text)
             return {"raw": r.text}
+        self._trace(method.upper(), path, r, payload=out)
+        return out
 
     @staticmethod
     def extract_system_ids(take_payload: Any) -> List[str]:

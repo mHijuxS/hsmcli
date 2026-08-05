@@ -7,14 +7,24 @@ reset) from the terminal.
 Modeled after `htbcli` and `hccli`: rich terminal output, name-based
 identifier resolution, JSON/YAML output for scripting, cookie-based auth.
 
+> **Unofficial.** Not affiliated with, endorsed by, or supported by Hack
+> Smarter. It drives the same private JSON API the web app uses — which is
+> undocumented and can change without notice, so expect breakage. Check
+> Hack Smarter's terms of service before using it, and use it only with
+> your own account and your own labs.
+
 ## Install
 
 ```bash
-git clone <this-repo> hsmcli && cd hsmcli
-./install.sh          # pip install -e . + /usr/local/bin symlink
-# or, with uv (recommended, keeps deps isolated):
-uv tool install .
+git clone https://github.com/mHijuxS/hsmcli && cd hsmcli
+uv tool install .        # recommended — keeps deps isolated
+# or
+pipx install .
+# or, into the current environment
+pip install .
 ```
+
+`hsmcli` is also runnable without installing: `python -m hsmcli`.
 
 ## Auth
 
@@ -87,8 +97,13 @@ hsmcli notifications | events | exams
 hsmcli heartbeat <name>                 # POST /api/heartbeat (keeps session warm)
 ```
 
-Every command accepts `--json` / `--yaml` for scripting. `--debug` dumps
-the raw API response of any call and exits.
+Every command accepts `--json` / `--yaml` for scripting. `--debug` traces
+every request and response to **stderr** — one line per call plus the
+payload — so it composes with the normal output:
+
+```bash
+hsmcli --debug labs list --json > labs.json 2> trace.log
+```
 
 ### Name resolution
 
@@ -209,12 +224,35 @@ Keys:
 - `base_url` — defaults to `https://www.hacksmarter.org`
 - `output_format` — `table` (default) | `json` | `yaml`
 
-Env vars: `HSMCLI_COOKIE` overrides the stored cookie.
+Env vars:
+
+- `HSMCLI_COOKIE` — overrides the stored cookie
+- `HSMCLI_USER_AGENT` — overrides the request `User-Agent`
 
 The config file holds your whole Supabase session — access token *and*
 refresh token — so it is created `0600` inside a `0700` directory, and a
 looser mode left by an earlier version is tightened on next run. Treat it
 like an SSH key.
+
+## What it talks to
+
+Everything goes to `base_url` (`https://www.hacksmarter.org`) except:
+
+- **`images.coursestack.com`** — lab thumbnails, for `lab <name> image`.
+  Public CDN, no cookies sent.
+- **`api.ipify.org`, `ifconfig.me`, `icanhazip.com`** — only when starting
+  an AWS lab, and only as a *fallback*. AWS labs scope their security group
+  to one `allowed_ip`; hsmcli prefers the `suggested_ip` the HackSmarter
+  API itself reports, and asks a third party for your egress address only
+  when that field is absent. Pass `--allowed-ip <ip>` to skip the lookup
+  entirely.
+
+Requests identify themselves as `hsmcli/<version> (+<repo url>)` — no
+browser spoofing. HackSmarter doesn't filter on `User-Agent` (its
+same-origin check is the `Referer` header, which hsmcli sets on the calls
+that need it), so there's nothing to work around. If that ever changes,
+`HSMCLI_USER_AGENT` takes any string, and `hsmcli.api_client
+.BROWSER_USER_AGENT` holds a browser one.
 
 ## Tests
 
@@ -232,7 +270,7 @@ keeping green.
 
 ## Requirements
 
-Python 3.8+, `requests`, `PyYAML`, `rich`.
+Python 3.9+, `requests`, `PyYAML`, `rich`. CI tests 3.9 through 3.14.
 
 ## License
 
