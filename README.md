@@ -41,16 +41,20 @@ hsmcli whoami
 
 ```bash
 # Discover
-hsmcli labs list                        # full catalog
-hsmcli labs list -e                     # only enrolled labs
+hsmcli labs list                        # challenge labs on the account (the default)
+hsmcli labs list -c all                 # every category: + guided/range/hackwith/foundations/courses
+hsmcli labs list -c range -c guided     # category filter (repeatable)
+hsmcli labs list -e                     # only /courses (the labs on your account)
+hsmcli labs list --catalog              # only /catalog (storefront cards, incl. bundles)
 hsmcli labs list -d easy -d medium      # difficulty filter (repeatable)
 hsmcli labs list -t in_progress         # state filter
-hsmcli labs list -c challenge -c range  # category filter (challenge/guided/range/hackwith/foundations/other)
 hsmcli labs list -s "active directory"  # substring filter on name/description
 hsmcli labs list --sort difficulty      # sort by name | difficulty | state
 
 # One lab — identifier comes first, then the action
-hsmcli lab <name> info                  # rich card + chapters + live systems
+hsmcli lab <name> info                  # rich card + chapters + lesson briefing + live systems
+hsmcli lab <name> info --full           # render every lesson's content (default: first 3)
+hsmcli lab <name> info --no-briefing    # metadata only, skip lesson content
 hsmcli lab <name> take                  # raw /take payload
 hsmcli lab <name> enroll                # POST /enroll
 hsmcli lab <name> systems               # live status of all systems
@@ -63,6 +67,15 @@ hsmcli lab <name> stop                  # /power off
 hsmcli lab <name> reset                 # /reset (new IP assigned)
 hsmcli lab <name> vpn -o me.ovpn        # download OpenVPN config
 hsmcli lab <name> image                 # download the lab thumbnail (--url-only to just print the URL)
+
+# AWS labs (Second, Beanstalk, Rotation, …) — same verbs, IAM keys instead of an IP
+hsmcli lab <name> launch                # start + poll until ready, then print credentials
+hsmcli lab <name> launch --allowed-ip 1.2.3.4   # override the auto-detected source IP
+hsmcli lab <name> creds                 # show the IAM keys again
+eval "$(hsmcli lab <name> creds --export)"      # load them into the shell for `aws`
+hsmcli lab <name> extend                # add another time_limit_minutes window
+hsmcli lab <name> stop                  # tear the environment down
+hsmcli lab <name> reset                 # tear down + re-provision (fresh keys)
 
 # Account
 hsmcli whoami
@@ -84,24 +97,58 @@ the name. Ambiguous matches list the candidates and exit non-zero:
 
 ```bash
 hsmcli lab implicit info                     # matches "Challenge Lab: Implicit (Easy)"
-hsmcli lab "Odyssey" launch                  # multi-word ok
+hsmcli lab "nova forge" launch               # multi-word ok; punctuation/spaces ignored
 hsmcli lab 37e66768-0973-4a1b-9ae6-… info    # UUID always works
 ```
+
+Precedence: UUID → exact name → exact **core** name → unique substring.
+The core name is the name with its category prefix and difficulty suffix
+stripped, so `odyssey` picks `Challenge Lab: Odyssey (Hard)` over
+`Hack With Me: Active Directory (Odyssey x Triathlon)`, which merely
+contains the word.
+
+### Categories
+
+`labs list` shows **challenge labs only** by default — 60 of 81 on a
+subscriber account. Guided labs, ranges, Hack-With-Me sessions, the
+Foundations tracks and the standalone courses are a different kind of
+thing, and lumping them in makes the list harder to scan. `-c all` widens
+to every category; `-c range -c guided` picks specific ones. The footer
+always names the active narrowing, so a filtered list never reads as
+complete.
+
+### `/catalog` is not the full list
+
+`/api/student/catalog` returns only the current storefront cards (41 vs 81
+on a subscriber account), so labs bought outside it never appeared in
+`labs list` — including in-progress ones. `/api/student/courses` is the
+complete set; `labs list` and name resolution both use the two merged.
+`/catalog` is still worth merging in: it carries `item.content_state`, and
+its `course_bundle` / `event` cards are dropped from the lab list (see
+`hsmcli bundles` / `hsmcli events`).
+
+The two endpoints also disagree on state vocabulary — `/courses` says
+`owned` where `/catalog` says `not_started` — so `-t owned` and
+`-t not_started` are treated as the same filter.
 
 ## Endpoint map
 
 | Command | Method | Path | Body |
 |---|---|---|---|
 | `whoami` | GET | `/api/student/profile` | — |
-| `labs list` | GET | `/api/student/catalog` | — |
+| `labs list` | GET | `/api/student/courses` + `/api/student/catalog` (merged) | — |
 | `labs list -e` | GET | `/api/student/courses` | — |
-| `lab info` | GET | `/api/student/courses/{id}` | — |
+| `labs list --catalog` | GET | `/api/student/catalog` | — |
+| `lab info` | GET | `/api/student/courses/{id}` + `/take` (briefing) | — |
 | `lab take` | GET | `/api/student/courses/{id}/take` | — |
 | `lab enroll` | POST | `/api/student/courses/{id}/enroll` | — |
 | `lab systems` / `status` | GET | `/api/student/courses/{playthrough}/systems?courseSystemIds=[…]` | — |
 | `lab launch` | POST | `.../systems/{sys}/launch` then `.../power` | `{"power":"on"}` |
 | `lab stop` | POST | `.../systems/{sys}/power` | `{"power":"off"}` |
 | `lab reset` | POST | `.../systems/{sys}/reset` | `{}` |
+| `lab systems` / `status` / `creds` (AWS) | GET | `/api/student/content/{playthrough}/aws-labs/{lab}` | — |
+| `lab launch` / `stop` / `reset` / `extend` (AWS) | POST | `/api/student/content/{playthrough}/aws-labs/{lab}/power` | `{"action":"start\|stop\|reset\|extend","inputs":{…}}` |
+| `lab submit` | POST | `/api/student/content/{playthrough}/lessons/{lesson}/submit-question` | `{questionId, submission}` |
 | `lab vpn` | GET | `/api/student/courses/{playthrough}/vpn` | — |
 | `lab image` | GET | `https://images.coursestack.com/{image_path}` | — |
 | `credits` | GET | `/api/student/credits/{customer_id}` | — |
@@ -119,6 +166,38 @@ The public `course.id` is **not** the id the lifecycle endpoints accept.
 `/systems`, `/launch`, `/power`, `/reset`, and `/vpn` all use
 `course.course_playthrough.id` — a separate handle created when you
 enroll. `hsmcli` auto-resolves it via `/take` transparently.
+
+The `/api/student/content/{id}/…` routes (AWS labs, flag submission) want
+that **same playthrough id**, despite the `content` segment — a lesson's
+own `content.id` gets a 403 there.
+
+### Three lab shapes
+
+| Shape | Example | Lifecycle endpoint | What you get |
+|---|---|---|---|
+| systems | Implicit | `/courses/{playthrough}/systems/{id}` | one VM + IP (VPN) |
+| networks | NovaForge | `/courses/{playthrough}/networks/{id}` | a subnet of VMs (VPN) |
+| aws | Second | `/content/{playthrough}/aws-labs/{id}` | IAM keys, no VPN |
+
+`hsmcli` sniffs the shape from `/take` and dispatches automatically, so
+`launch` / `stop` / `reset` / `status` work the same on all three.
+
+### AWS labs
+
+An AWS lab runs terraform against a throwaway AWS account and scopes its
+security group to a single `allowed_ip`. `launch` fills that in from the
+`suggested_ip` the API itself reports (the address HackSmarter sees you
+from) — pass `--allowed-ip` if the traffic will come from somewhere else,
+or `--input KEY=VALUE` for any other input a lab declares in
+`student_inputs`. Labs are time-boxed (`time_limit_minutes`, typically
+60); `extend` buys another window.
+
+```bash
+hsmcli lab second launch                 # ~2 min of terraform, then keys
+eval "$(hsmcli lab second creds --export)"
+aws sts get-caller-identity
+hsmcli lab second stop                   # done — stop paying for runtime
+```
 
 ## Config
 

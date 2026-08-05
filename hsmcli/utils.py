@@ -2,7 +2,7 @@
 
 import json as _json
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, List
 
 
@@ -74,6 +74,27 @@ def format_datetime(dt: str) -> str:
         )
     except (ValueError, TypeError):
         return dt
+
+
+def format_time_left(dt: str) -> str:
+    """'42m left' / '1h12m left' / 'expired' for an ISO8601 deadline.
+
+    Returns '' when the timestamp is missing or unparseable so callers can
+    fall back to printing the raw value.
+    """
+    if not dt or not isinstance(dt, str):
+        return ""
+    try:
+        deadline = datetime.fromisoformat(dt.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return ""
+    if deadline.tzinfo is None:
+        deadline = deadline.replace(tzinfo=timezone.utc)
+    secs = int((deadline - datetime.now(timezone.utc)).total_seconds())
+    if secs <= 0:
+        return "expired"
+    hours, mins = divmod(secs // 60, 60)
+    return f"{hours}h{mins:02d}m left" if hours else f"{mins}m left"
 
 
 def format_difficulty(diff: str) -> str:

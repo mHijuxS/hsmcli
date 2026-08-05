@@ -26,6 +26,38 @@ COOKIE_DOMAIN = ".hacksmarter.org"
 # the course's `image_path` field — public, no auth/cookies required.
 IMAGE_BASE_URL = "https://images.coursestack.com"
 
+# The actions the AWS-lab /power endpoint accepts (the server validates this
+# enum and rejects anything else with a 400).
+AWS_LAB_ACTIONS = ("start", "stop", "reset", "extend")
+
+# Fallback egress-IP lookups for an AWS lab's ``allowed_ip`` input. A stopped
+# lab's status payload already carries ``suggested_ip`` (the server sees our
+# address), so these are only needed when that field is absent.
+PUBLIC_IP_SERVICES = (
+    "https://api.ipify.org",
+    "https://ifconfig.me/ip",
+    "https://icanhazip.com",
+)
+
+
+def detect_public_ip(timeout: float = 5.0) -> Optional[str]:
+    """Best-effort public egress IP, or ``None`` if every service fails.
+
+    Note this is *our* egress as seen from the open internet — if a lab VPN
+    is up it may differ from what HackSmarter sees. Prefer the API's own
+    ``suggested_ip`` when available.
+    """
+    for url in PUBLIC_IP_SERVICES:
+        try:
+            r = requests.get(url, timeout=timeout)
+            r.raise_for_status()
+            ip = r.text.strip()
+            if re.fullmatch(r"[0-9A-Fa-f:.]{7,45}", ip):
+                return ip
+        except Exception:
+            continue
+    return None
+
 
 def parse_cookie_header(raw: str) -> Dict[str, str]:
     """Parse a browser ``Cookie:`` header into ``{name: value}``.
@@ -102,6 +134,7 @@ class HackSmarterAPI:
         })
 
         self._session_data: Optional[Dict[str, Any]] = None
+        self._take_cache: Dict[str, Any] = {}
 
         cookie = self.config.get_cookie()
         if cookie:
@@ -243,32 +276,48 @@ class HackSmarterAPI:
                 f.write(content)
         return content
 
-    def get_course_take(self, course_id: str) -> Dict[str, Any]:
-        return self._request("GET", f"/api/student/courses/{course_id}/take")
+    def get_course_take(self, course_id: str, use_cache: bool = False) -> Dict[str, Any]:
+        """Full lesson payload — content items, playthrough and lab ids.
+
+        ``use_cache`` memoizes the response for the life of the process.
+        A single command can need /take several times (``lab info`` renders
+        the briefing *and* looks up system status; ``launch --wait`` polls),
+        and the parts those callers use — ids, lesson content — don't change
+        mid-run. Callers that read mutable state (question results) leave it
+        off and always hit the network.
+        """
+        if use_cache and course_id in self._take_cache:
+            return self._take_cache[course_id]
+        data = self._request("GET", f"/api/student/courses/{course_id}/take")
+        self._take_cache[course_id] = data
+        return data
 
     def enroll_course(self, course_id: str) -> Dict[str, Any]:
         return self._request("POST", f"/api/student/courses/{course_id}/enroll")
 
-    # ── lab lifecycle (systems + networks) ────────────────────────────────
+    # ── lab lifecycle (systems + networks + aws) ──────────────────────────
 
     def _ensure_playthrough(self, course_id: str) -> Dict[str, Any]:
         """Fetch /take and pull the ids the lifecycle endpoints need.
 
-        HackSmarter has TWO lab shapes:
+        HackSmarter has THREE lab shapes:
           * "systems" labs (single VM, e.g. Implicit) — use ``/systems/{id}/*``
             and ``courseSystemIds=[…]`` for status.
           * "networks" labs (multi-VM subnet, e.g. NovaForge) — use
             ``/networks/{id}/*`` and ``content_network_ids=[…]``.
+          * "aws" labs (a terraform-provisioned AWS account, e.g. Second) —
+            no VM at all; use ``/content/{playthrough}/aws-labs/{id}`` and
+            you get IAM keys back instead of an IP.
 
         The public ``course.id`` is *not* the id used for lifecycle ops;
         those use ``course.course_playthrough.id`` (a handle created on
         enroll). The heartbeat also needs a lesson id.
 
         Returns a dict with ``playthrough_id``, ``lesson_id``, ``course_id``,
-        ``customer_id``, ``system_ids``, ``network_ids``, and ``kind``
-        (``"systems"`` | ``"networks"`` | ``"none"``).
+        ``customer_id``, ``system_ids``, ``network_ids``, ``aws_labs``, and
+        ``kind`` (``"systems"`` | ``"networks"`` | ``"aws"`` | ``"none"``).
         """
-        take = self.get_course_take(course_id)
+        take = self.get_course_take(course_id, use_cache=True)
         body = take.get("course", take) if isinstance(take, dict) else {}
         playthrough = body.get("course_playthrough") if isinstance(body, dict) else None
         playthrough_id = (playthrough or {}).get("id")
@@ -283,9 +332,17 @@ class HackSmarterAPI:
                     break
         system_ids = self.extract_system_ids(take)
         network_ids = self.extract_network_ids(take)
+        aws_labs = self.extract_aws_labs(take)
         # Prefer networks when the lab has any — a lab may nominally have
-        # both but the browser drives it via /networks in that case.
-        kind = "networks" if network_ids else ("systems" if system_ids else "none")
+        # both but the browser drives it via /networks in that case. AWS
+        # labs are last: they never coexist with VMs in practice, so this
+        # only decides the fallback when there's nothing to power on.
+        kind = (
+            "networks" if network_ids
+            else "systems" if system_ids
+            else "aws" if aws_labs
+            else "none"
+        )
         return {
             "playthrough_id": playthrough_id,
             "lesson_id": lesson_id,
@@ -293,9 +350,14 @@ class HackSmarterAPI:
             "customer_id": body.get("customer_id") if isinstance(body, dict) else None,
             "system_ids": system_ids,
             "network_ids": network_ids,
+            "aws_labs": aws_labs,
             "kind": kind,
             "take": take,
         }
+
+    def lab_kind(self, course_id: str) -> str:
+        """``"systems"`` | ``"networks"`` | ``"aws"`` | ``"none"`` for a lab."""
+        return self._ensure_playthrough(course_id)["kind"]
 
     def get_lab_systems(
         self, course_id: str, system_ids: Optional[List[str]] = None
@@ -475,6 +537,133 @@ class HackSmarterAPI:
         walk(take_payload)
         return ids
 
+    # ── AWS labs ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def extract_aws_labs(take_payload: Any) -> List[Dict[str, Any]]:
+        """Enumerate the AWS labs a /take payload references, as
+        ``[{"id": …, "name": …}]``.
+
+        Names live in ``static_aws_labs[]``, which sits *beside* ``course``
+        at the top level of /take rather than inside it. The lesson body
+        points at the same labs via ``content.items[]`` entries of type
+        ``aws-lab`` carrying ``aws_lab_id`` — we merge both sources so a
+        lab still surfaces (nameless) if only one half is present.
+        """
+        names: Dict[str, str] = {}
+        order: List[str] = []
+
+        def add(lab_id: Any, name: Any = None):
+            if not isinstance(lab_id, str) or not lab_id:
+                return
+            if lab_id not in names:
+                order.append(lab_id)
+                names[lab_id] = ""
+            if isinstance(name, str) and name and not names[lab_id]:
+                names[lab_id] = name
+
+        if isinstance(take_payload, dict):
+            body = take_payload.get("course", take_payload)
+            for source in (take_payload, body):
+                if not isinstance(source, dict):
+                    continue
+                for entry in (source.get("static_aws_labs") or []):
+                    if isinstance(entry, dict):
+                        add(entry.get("id"), entry.get("name"))
+
+        for les in HackSmarterAPI.extract_lessons(take_payload):
+            for it in les["items"]:
+                if it.get("aws_lab_id") or str(it.get("type") or "") == "aws-lab":
+                    add(it.get("aws_lab_id"), it.get("name"))
+
+        return [{"id": i, "name": names[i]} for i in order]
+
+    def _aws_lab_base(self, course_id: str) -> str:
+        """``/api/student/content/{playthrough}/aws-labs`` for a course.
+
+        Despite the ``/content/`` segment, that first id is the *playthrough*
+        id (``course.course_playthrough.id``) — the same handle the
+        ``/courses/{…}/systems`` endpoints take. Passing a lesson's
+        ``content.id`` here returns 403.
+        """
+        pt = self._ensure_playthrough(course_id)
+        playthrough_id = pt["playthrough_id"]
+        if not playthrough_id:
+            raise Exception("no active playthrough — enroll first")
+        return f"/api/student/content/{playthrough_id}/aws-labs"
+
+    def get_aws_lab(self, course_id: str, aws_lab_id: str) -> Dict[str, Any]:
+        """Live status of one AWS lab.
+
+        Shape: ``{state, access_mode, name, expires_at, allow_extend,
+        time_limit_minutes, terraform_outputs, error_message,
+        student_inputs, suggested_ip}``. ``state`` is ``"na"`` before the
+        first start and ``"ready"`` once terraform has applied;
+        ``terraform_outputs`` (the IAM keys) only appears when ready, and
+        ``suggested_ip`` only while it is not.
+        """
+        return self._request("GET", f"{self._aws_lab_base(course_id)}/{aws_lab_id}")
+
+    def get_aws_labs(self, course_id: str) -> List[Dict[str, Any]]:
+        """Status of every AWS lab in a course (one GET each).
+
+        Each entry is the raw status payload plus ``aws_lab_id``; a lab
+        whose status call fails degrades to ``state: "unknown"`` with the
+        error in ``error_message`` rather than sinking the whole listing.
+        """
+        pt = self._ensure_playthrough(course_id)
+        out: List[Dict[str, Any]] = []
+        for entry in pt["aws_labs"]:
+            lab_id = entry.get("id")
+            if not lab_id:
+                continue
+            try:
+                status = self.get_aws_lab(course_id, lab_id)
+            except Exception as e:
+                status = {"state": "unknown", "error_message": str(e)}
+            if not isinstance(status, dict):
+                status = {"state": "unknown", "raw": status}
+            out.append({
+                **status,
+                "aws_lab_id": lab_id,
+                "name": status.get("name") or entry.get("name") or "",
+            })
+        return out
+
+    def aws_lab_power(
+        self,
+        course_id: str,
+        aws_lab_id: str,
+        action: str,
+        inputs: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        """Drive an AWS lab — ``start`` | ``stop`` | ``reset`` | ``extend``.
+
+        ``POST .../aws-labs/{id}/power`` with ``{"action", "inputs"}``.
+        ``inputs`` is a free-form ``{str: str}`` map; which keys a lab wants
+        is declared in its status under ``student_inputs[].type`` — in
+        practice just ``allowed_ip``, which scopes the lab's security group
+        to your egress address. As with the VM endpoints the server checks
+        the ``Referer`` against the course's /take page.
+        """
+        if action not in AWS_LAB_ACTIONS:
+            raise ValueError(
+                f"unsupported AWS lab action '{action}' "
+                f"(expected one of {', '.join(AWS_LAB_ACTIONS)})"
+            )
+        pt = self._ensure_playthrough(course_id)
+        real_course_id = pt["course_id"] or course_id
+        take_referer = f"{self.base_url}/courses/{real_course_id}/take"
+        body: Dict[str, Any] = {"action": action}
+        if inputs:
+            body["inputs"] = {k: str(v) for k, v in inputs.items()}
+        return self._power_call(
+            "POST",
+            f"{self._aws_lab_base(course_id)}/{aws_lab_id}/power",
+            body,
+            take_referer,
+        )
+
     # ── VPN ───────────────────────────────────────────────────────────────
     def get_vpn_config(self, course_id: str, dest_path: Optional[str] = None) -> str:
         """Download the OpenVPN config for a lab.
@@ -527,29 +716,68 @@ class HackSmarterAPI:
     def submit_question(
         self,
         course_id: str,
-        content_id: str,
         lesson_id: str,
         question_id: str,
         submission: str,
     ) -> Dict[str, Any]:
         """Submit a flag / free-text answer to a lesson question.
 
-        Endpoint: ``POST /api/student/content/{content_id}/lessons/{lesson_id}
-        /submit-question`` with body ``{questionId, submission}``. The server
-        checks the ``Referer`` against ``/courses/{course_id}/take``.
+        Endpoint: ``POST /api/student/content/{playthrough}/lessons/
+        {lesson_id}/submit-question`` with body ``{questionId, submission}``.
+        The ``/content/`` segment takes the *playthrough* id, not the
+        lesson's own ``content.id`` (that one 403s) — same convention as the
+        AWS-lab endpoints. The server also checks the ``Referer`` against
+        ``/courses/{course_id}/take``.
 
-        Returns the server's verdict payload (typically
-        ``{correct, matchedAnswer, …}``).
+        Returns the server's verdict payload, which nests the verdict:
+        ``{"result": {"is_correct": bool, "answer_text": str}}``.
         """
         pt = self._ensure_playthrough(course_id)
+        playthrough_id = pt["playthrough_id"]
+        if not playthrough_id:
+            raise Exception("no active playthrough — enroll first")
         real_course_id = pt["course_id"] or course_id
         take_referer = f"{self.base_url}/courses/{real_course_id}/take"
         return self._power_call(
             "POST",
-            f"/api/student/content/{content_id}/lessons/{lesson_id}/submit-question",
+            f"/api/student/content/{playthrough_id}/lessons/{lesson_id}/submit-question",
             {"questionId": question_id, "submission": submission},
             take_referer,
         )
+
+    @staticmethod
+    def extract_lessons(take_payload: Any) -> List[Dict[str, Any]]:
+        """Flatten ``course.chapters[].lessons[]`` out of a /take payload.
+
+        Each entry keeps the enclosing chapter name plus the lesson's
+        ``content.items[]`` — the markdown briefing, video links, lab
+        references and questions the web UI renders on the lesson page.
+        Only /take carries these; ``GET /courses/{id}`` returns lessons
+        as bare name/slug stubs.
+        """
+        body = (
+            take_payload.get("course", take_payload)
+            if isinstance(take_payload, dict) else {}
+        )
+        out: List[Dict[str, Any]] = []
+        for ch in (body.get("chapters") or []):
+            if not isinstance(ch, dict):
+                continue
+            for les in (ch.get("lessons") or []):
+                if not isinstance(les, dict):
+                    continue
+                content = les.get("content")
+                content = content if isinstance(content, dict) else {}
+                items = content.get("items")
+                out.append({
+                    "chapter": ch.get("name"),
+                    "lesson": les.get("name"),
+                    "lesson_id": les.get("id"),
+                    "content_id": content.get("id"),
+                    "completed": bool(les.get("completed")),
+                    "items": [it for it in (items or []) if isinstance(it, dict)],
+                })
+        return out
 
     @staticmethod
     def extract_questions(take_payload: Any) -> List[Dict[str, Any]]:

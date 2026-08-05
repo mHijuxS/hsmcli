@@ -5,41 +5,48 @@ Commands:
     hsmcli config set-cookie "<paste Cookie header>"
     hsmcli config show
     hsmcli whoami
-    hsmcli labs list [--search q] [--enrolled]
-    hsmcli lab <id-or-name> info
+    hsmcli labs list [--search q] [--enrolled | --catalog]
+    hsmcli lab <id-or-name> info [--full] [--no-briefing]
     hsmcli lab <id-or-name> enroll
     hsmcli lab <id-or-name> systems
     hsmcli lab <id-or-name> launch [<system-id-or-name>] [--no-wait]
     hsmcli lab <id-or-name> stop | reset
+    hsmcli lab <id-or-name> creds [--export]   # AWS labs
+    hsmcli lab <id-or-name> extend             # AWS labs
     hsmcli lab <id-or-name> vpn [-o file.ovpn]
     hsmcli notifications | events | exams | subscriptions | orgs | bundles
 """
 
 import argparse
 import os
+import re
+import shlex
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-from rich.console import Console
+from rich.console import Console, Group
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from .api_client import HackSmarterAPI
+from .api_client import HackSmarterAPI, detect_public_ip
 from .config import Config
 from .resolvers import (
     _extract_items,
     _item_id,
     _item_name,
+    all_lab_items,
     is_uuid,
     resolve_course_id,
+    resolve_from_list,
     resolve_system_id,
 )
 from .utils import (
     Colors,
     format_datetime,
     format_difficulty,
+    format_time_left,
     print_error,
     print_info,
     print_json,
@@ -76,6 +83,17 @@ STATE_STYLE = {
     "not_launched": "dim",
     "error": "red",
     "failed": "red",
+    # AWS-lab states: "na" = never started / torn down, "ready" = terraform
+    # applied and the IAM keys are live.
+    "ready": "green",
+    "na": "dim",
+    "creating": "yellow",
+    "updating": "yellow",
+    "pending": "yellow",
+    "destroying": "yellow",
+    "stopping": "yellow",
+    "destroyed": "dim",
+    "unknown": "red",
 }
 
 
@@ -276,13 +294,25 @@ def _lab_category(name: str) -> str:
     return "other"
 
 
+# "labs" means challenge labs to anyone using this tool — the guided labs,
+# ranges, Hack-With-Me sessions and courses are a different kind of thing.
+# Default to those, with -c all to widen.
+DEFAULT_CATEGORIES = ("challenge",)
+
+
 def cmd_labs_list(api: HackSmarterAPI, config: Config, args) -> int:
     fmt = _format_choice(args, config)
+    # Raw-response escape hatch for --json/--yaml when nothing extracts;
+    # the merged path has no single response to fall back to.
+    payload: Any = []
     if args.enrolled:
         payload = api.get_enrolled_courses()
-    else:
+        items = _extract_items(payload)
+    elif args.catalog:
         payload = api.get_catalog()
-    items = _extract_items(payload)
+        items = _extract_items(payload)
+    else:
+        items = all_lab_items(api)
 
     if args.search:
         q = args.search.lower()
@@ -297,13 +327,19 @@ def cmd_labs_list(api: HackSmarterAPI, config: Config, args) -> int:
 
     if args.state:
         wanted = {s.lower() for s in args.state}
+        # The two endpoints spell "have access, haven't started" differently
+        # (/courses says "owned", /catalog says "not_started"), so either
+        # spelling matches both — otherwise the filter silently drops rows
+        # depending on which endpoint a lab came from.
+        if wanted & {"owned", "not_started"}:
+            wanted |= {"owned", "not_started"}
         items = [it for it in items
                  if (_extract_state(it) or "").lower() in wanted]
 
-    if args.category:
-        wanted = set(args.category)
+    cats = set(args.category) or set(DEFAULT_CATEGORIES)
+    if "all" not in cats:
         items = [it for it in items
-                 if _lab_category(_item_name(it)) in wanted]
+                 if _lab_category(_item_name(it)) in cats]
 
     if args.sort:
         _DIFF_RANK = {"easy": 1, "beginner": 1, "medium": 2, "intermediate": 2,
@@ -328,12 +364,18 @@ def cmd_labs_list(api: HackSmarterAPI, config: Config, args) -> int:
         print_yaml(items if items else payload)
         return 0
 
+    # Say when the default narrowing is in play. A list that quietly shows a
+    # subset is exactly what hid the in-progress labs before.
+    default_note = (" — challenge labs only; -c all for everything"
+                    if not args.category else "")
+
     if not items:
-        print_warning("No labs match your filters. (Try --json to inspect raw response.)")
+        print_warning(f"No labs match your filters{default_note}. "
+                      f"(Try --json to inspect raw response.)")
         return 0
     _render_labs_table(items)
     print()
-    print_info(f"{len(items)} lab(s)")
+    print_info(f"{len(items)} lab(s){default_note}")
     return 0
 
 
@@ -345,6 +387,114 @@ def _unwrap_course(data: Any) -> Dict[str, Any]:
     if isinstance(body, dict) and "course" in body and isinstance(body["course"], dict):
         body = body["course"]
     return body if isinstance(body, dict) else {}
+
+
+# How many content-bearing lessons `lab info` renders before it stops and
+# asks for --full. Labs are 1–2 lessons; multi-chapter courses would bury
+# the metadata under a wall of text.
+BRIEFING_LESSON_LIMIT = 3
+
+# HSM collapses the community-walkthrough lists behind raw <details>/
+# <summary> HTML, which rich's Markdown renderer prints verbatim. Strip the
+# tags and keep the inner text.
+_HTML_DETAILS_RE = re.compile(r"</?(?:details|summary)[^>]*>", re.I)
+
+
+def _clean_markdown(md: str) -> str:
+    return _HTML_DETAILS_RE.sub("", md or "").strip()
+
+
+def _lesson_renderables(items: List[Dict[str, Any]],
+                        lab_names: Dict[str, str]) -> List[Any]:
+    """Turn a lesson's ``content.items[]`` into printable rich renderables.
+
+    Item types seen in the wild: ``text`` (markdown briefing), ``video``,
+    ``aws-lab`` / ``system`` / ``network`` (lab references), and
+    ``question-*``. Anything unknown degrades to a dim one-liner rather
+    than vanishing.
+    """
+    out: List[Any] = []
+    for it in items:
+        itype = str(it.get("type") or "")
+        if itype == "text":
+            md = _clean_markdown(it.get("markdown") or it.get("content") or "")
+            if md:
+                # hyperlinks=False prints "text (url)" instead of an OSC-8
+                # escape — walkthrough//video URLs are worth copying, and
+                # not every terminal renders the escape.
+                out.append(Markdown(md, hyperlinks=False))
+        elif itype == "video":
+            url = it.get("url") or it.get("video_url") or "?"
+            out.append(Text(f"▶ video: {url}", style="blue"))
+        elif itype.startswith("question"):
+            t = Text("? ", style="bold")
+            t.append((it.get("question") or "?").strip(), style="white")
+            t.append("  ")
+            t.append(_badge(it.get("state") or "not_attempted",
+                            QUESTION_STATE_STYLE))
+            out.append(t)
+        elif itype in ("aws-lab", "system", "network", "lab"):
+            ref = (it.get("aws_lab_id") or it.get("system_id")
+                   or it.get("network_id") or it.get("id") or "?")
+            name = lab_names.get(ref)
+            label = f"{name} ({ref})" if name else str(ref)
+            out.append(Text(f"⚙ {itype}: {label}", style="dim"))
+        else:
+            detail = it.get("url") or it.get("name") or it.get("id") or ""
+            out.append(Text(f"• {itype or 'item'}: {detail}".rstrip(": "),
+                            style="dim"))
+    return out
+
+
+def _lab_reference_names(take: Any) -> Dict[str, str]:
+    """id → name for the labs/systems a /take payload lists alongside the
+    lesson content (``static_aws_labs``, ``static_systems``)."""
+    names: Dict[str, str] = {}
+    if not isinstance(take, dict):
+        return names
+    for key in ("static_aws_labs", "static_systems", "static_networks"):
+        for entry in (take.get(key) or []):
+            if isinstance(entry, dict) and entry.get("id"):
+                names[entry["id"]] = entry.get("name") or ""
+    return names
+
+
+def _render_briefing(api: HackSmarterAPI, course_id: str, full: bool) -> Optional[str]:
+    """Render the lesson content (markdown briefing, video, questions).
+
+    Lives only in /take — ``GET /courses/{id}`` returns lesson stubs — so
+    this needs enrollment; a 403 here is informational, not fatal. Returns
+    the error message when /take was unreachable (the caller skips the
+    system-status lookup then — it reads the same endpoint), else None.
+    """
+    try:
+        take = api.get_course_take(course_id, use_cache=True)
+    except Exception as e:
+        return str(e)
+
+    lessons = [l for l in api.extract_lessons(take) if l["items"]]
+    if not lessons:
+        return None
+
+    lab_names = _lab_reference_names(take)
+    shown = lessons if full else lessons[:BRIEFING_LESSON_LIMIT]
+    for les in shown:
+        body = _lesson_renderables(les["items"], lab_names)
+        if not body:
+            continue
+        title = les.get("lesson") or les.get("chapter") or "Lesson"
+        chapter = les.get("chapter")
+        if chapter and chapter != title:
+            title = f"{chapter} › {title}"
+        if les.get("completed"):
+            title += " ✓"
+        console.print(Panel(Group(*body), title=title,
+                            border_style="dim", padding=(0, 2)))
+
+    hidden = len(lessons) - len(shown)
+    if hidden > 0:
+        print_info(f"{hidden} more lesson(s) with content — pass --full to render them")
+    return None
 
 
 def cmd_lab_info(api: HackSmarterAPI, config: Config, args) -> int:
@@ -422,15 +572,35 @@ def cmd_lab_info(api: HackSmarterAPI, config: Config, args) -> int:
                       f"{done}/{len(lessons)}")
         console.print(t)
 
+    # Lesson content — the actual briefing (walkthrough links, hints,
+    # starting credentials, questions). Only /take carries it.
+    take_error: Optional[str] = None
+    if not getattr(args, "no_briefing", False):
+        take_error = _render_briefing(api, course_id,
+                                      full=getattr(args, "full", False))
+
     # Live systems / network status — get_lab_systems auto-detects the
     # lab kind (systems vs networks) and picks the right endpoint / ids.
-    try:
-        sys_payload = api.get_lab_systems(course_id)
-        sys_items = _flatten_lab_items(_extract_items(sys_payload))
-        if sys_items:
-            _render_systems_table(sys_items, title="Systems (live status)")
-    except Exception as e:
-        console.print(f"[dim]systems status unavailable: {e}[/dim]")
+    # It reads /take too, so a failure above means this can only repeat it.
+    if take_error:
+        console.print(f"[dim]lesson content + system status unavailable: "
+                      f"{take_error}[/dim]")
+    else:
+        try:
+            if api.lab_kind(course_id) == "aws":
+                aws_labs = api.get_aws_labs(course_id)
+                if aws_labs:
+                    _render_aws_table(aws_labs, title="AWS labs (live status)")
+                    for lab in aws_labs:
+                        if _aws_state(lab) in AWS_READY_STATES:
+                            _render_aws_creds(lab)
+            else:
+                sys_payload = api.get_lab_systems(course_id)
+                sys_items = _flatten_lab_items(_extract_items(sys_payload))
+                if sys_items:
+                    _render_systems_table(sys_items, title="Systems (live status)")
+        except Exception as e:
+            console.print(f"[dim]systems status unavailable: {e}[/dim]")
 
     # Pricing hint (compact)
     prices = body.get("bundle_pricing") or []
@@ -543,6 +713,15 @@ def _render_systems_table(items: List[Dict[str, Any]], title: str = "Systems"):
 def cmd_lab_systems(api: HackSmarterAPI, config: Config, args) -> int:
     fmt = _format_choice(args, config)
     course_id = resolve_course_id(api, args.identifier)
+    if api.lab_kind(course_id) == "aws":
+        labs = api.get_aws_labs(course_id)
+        if fmt in ("json", "yaml"):
+            print_output(labs, fmt); return 0
+        if not labs:
+            print_warning("No AWS labs returned.")
+            return 0
+        _render_aws_table(labs, title=f"AWS labs — {course_id}")
+        return 0
     payload = api.get_lab_systems(course_id)
     # Keep raw for --json (users may want the network wrapper visible);
     # flatten for the table rendering.
@@ -563,6 +742,23 @@ def cmd_lab_status(api: HackSmarterAPI, config: Config, args) -> int:
     """Compact 'is my lab on?' check for one lab."""
     fmt = _format_choice(args, config)
     course_id = resolve_course_id(api, args.identifier)
+    if api.lab_kind(course_id) == "aws":
+        labs = api.get_aws_labs(course_id)
+        if fmt in ("json", "yaml"):
+            print_output(labs, fmt); return 0
+        if not labs:
+            print_warning("No AWS labs in this course.")
+            return 0
+        ready = [l for l in labs if _aws_state(l) in AWS_READY_STATES]
+        header = Text()
+        header.append(f"{len(ready)}/{len(labs)} AWS lab(s) ready",
+                      style="green" if ready else "dim")
+        console.print(Panel(header, border_style="green" if ready else "dim",
+                            padding=(0, 2)))
+        _render_aws_table(labs, title="Live status")
+        for lab in ready:
+            _render_aws_creds(lab)
+        return 0
     payload = api.get_lab_systems(course_id)
     raw_items = _extract_items(payload)
     items = _flatten_lab_items(raw_items)
@@ -587,6 +783,11 @@ def cmd_lab_launch(api: HackSmarterAPI, config: Config, args) -> int:
     import time
     fmt = _format_choice(args, config)
     course_id = resolve_course_id(api, args.identifier)
+
+    # AWS labs have no VM to power on — different endpoint, different
+    # payload, credentials instead of an IP.
+    if api.lab_kind(course_id) == "aws":
+        return _cmd_lab_launch_aws(api, config, args, course_id)
 
     if args.system:
         system_id = resolve_system_id(api, course_id, args.system)
@@ -694,6 +895,9 @@ def _resolve_lab_system(api: HackSmarterAPI, args) -> tuple:
 
 def cmd_lab_stop(api: HackSmarterAPI, config: Config, args) -> int:
     fmt = _format_choice(args, config)
+    course_id = resolve_course_id(api, args.identifier)
+    if api.lab_kind(course_id) == "aws":
+        return _cmd_lab_aws_action(api, config, args, course_id, "stop")
     course_id, system_id = _resolve_lab_system(api, args)
     data = api.power_off_system(course_id, system_id)
     if fmt in ("json", "yaml"):
@@ -704,6 +908,9 @@ def cmd_lab_stop(api: HackSmarterAPI, config: Config, args) -> int:
 
 def cmd_lab_reset(api: HackSmarterAPI, config: Config, args) -> int:
     fmt = _format_choice(args, config)
+    course_id = resolve_course_id(api, args.identifier)
+    if api.lab_kind(course_id) == "aws":
+        return _cmd_lab_aws_action(api, config, args, course_id, "reset")
     course_id, system_id = _resolve_lab_system(api, args)
     data = api.reset_system(course_id, system_id)
     if fmt in ("json", "yaml"):
@@ -723,11 +930,315 @@ def cmd_lab_reset(api: HackSmarterAPI, config: Config, args) -> int:
     return 0
 
 
+# ── AWS labs ──────────────────────────────────────────────────────────────
+#
+# An AWS lab has no VM and no VPN: HackSmarter runs terraform against a
+# throwaway AWS account and hands back IAM keys, with the lab's security
+# group scoped to one `allowed_ip`. Lifecycle rides the same verbs as the
+# VM labs (launch/stop/reset) plus `extend`, so the commands below slot
+# into the existing `hsmcli lab <id> <action>` surface.
+
+# States that end a `launch` poll. Deliberately narrow: anything else
+# (including a status read we couldn't parse) keeps polling until the
+# timeout rather than reporting a failure that didn't happen.
+AWS_READY_STATES = ("ready",)
+AWS_FAILED_STATES = ("error", "failed")
+
+# terraform output key → the env var the AWS CLI/SDKs actually read.
+_AWS_ENV_KEYS = {
+    "access_key": "AWS_ACCESS_KEY_ID",
+    "access_key_id": "AWS_ACCESS_KEY_ID",
+    "secret_key": "AWS_SECRET_ACCESS_KEY",
+    "secret_access_key": "AWS_SECRET_ACCESS_KEY",
+    "session_token": "AWS_SESSION_TOKEN",
+    "region": "AWS_DEFAULT_REGION",
+    "default_region": "AWS_DEFAULT_REGION",
+}
+
+
+def _aws_state(lab: Dict[str, Any]) -> str:
+    return str(lab.get("state") or "unknown").lower()
+
+
+def _render_aws_table(labs: List[Dict[str, Any]], title: str = "AWS labs"):
+    t = Table(title=title, show_header=True,
+              header_style="bold", border_style="dim")
+    t.add_column("#", justify="right", style="dim")
+    t.add_column("Name")
+    t.add_column("ID", style="dim")
+    t.add_column("State")
+    t.add_column("Expires")
+    t.add_column("Limit", justify="right", style="dim")
+    for i, lab in enumerate(labs, 1):
+        expires = str(lab.get("expires_at") or "")
+        left = format_time_left(expires)
+        when = format_datetime(expires) if expires else "—"
+        if left:
+            when = f"{when} ({left})"
+        limit = lab.get("time_limit_minutes")
+        t.add_row(
+            str(i),
+            truncate(lab.get("name") or "?", 40),
+            str(lab.get("aws_lab_id") or ""),
+            _badge(_aws_state(lab), STATE_STYLE),
+            when,
+            f"{limit}m" if limit else "—",
+        )
+    console.print(t)
+
+
+def _aws_env_exports(outputs: Dict[str, Any]) -> List[str]:
+    """``export FOO=bar`` lines for a lab's terraform outputs.
+
+    Known keys map onto the standard AWS env vars so `eval` is enough to
+    make the aws CLI work; anything else is passed through as
+    ``HSM_<KEY>`` rather than dropped.
+    """
+    lines: List[str] = []
+    for k, v in outputs.items():
+        if isinstance(v, (dict, list)) or v is None:
+            continue
+        env = _AWS_ENV_KEYS.get(str(k).lower())
+        if not env:
+            env = "HSM_" + re.sub(r"[^A-Z0-9]+", "_", str(k).upper()).strip("_")
+        lines.append(f"export {env}={shlex.quote(str(v))}")
+    return lines
+
+
+def _render_aws_creds(lab: Dict[str, Any]) -> bool:
+    """Print a lab's terraform outputs (the IAM keys). False if none yet."""
+    outputs = lab.get("terraform_outputs") or {}
+    if not isinstance(outputs, dict) or not outputs:
+        return False
+    t = Table(show_header=False, border_style="dim", box=None, padding=(0, 2))
+    t.add_column("key", style="cyan")
+    t.add_column("value")
+    for k, v in outputs.items():
+        t.add_row(str(k), str(v) if not isinstance(v, (dict, list)) else str(v))
+    expires = str(lab.get("expires_at") or "")
+    left = format_time_left(expires)
+    title = f"Credentials — {lab.get('name') or lab.get('aws_lab_id')}"
+    subtitle = None
+    if expires:
+        subtitle = f"expires {format_datetime(expires)}" + (f" ({left})" if left else "")
+    console.print(Panel(t, title=title, subtitle=subtitle,
+                        border_style="green", padding=(0, 2)))
+    return True
+
+
+def _resolve_aws_lab(api: HackSmarterAPI, course_id: str,
+                     selector: Optional[str]) -> Dict[str, Any]:
+    """Pick one AWS lab from a course — by name/UUID, or the only one."""
+    labs = api.get_aws_labs(course_id)
+    if not labs:
+        raise LookupError("this lab has no AWS labs")
+    if selector:
+        lab_id, item = resolve_from_list(selector, labs)
+        if item is not None:
+            return item
+        # A UUID we didn't see in /take — ask the API about it directly.
+        status = api.get_aws_lab(course_id, lab_id)
+        return {**status, "aws_lab_id": lab_id}
+    if len(labs) == 1:
+        return labs[0]
+    _render_aws_table(labs)
+    raise LookupError("this course has multiple AWS labs — name one explicitly")
+
+
+def _parse_kv(pairs: Optional[List[str]]) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for p in (pairs or []):
+        k, sep, v = str(p).partition("=")
+        if not sep or not k.strip():
+            raise LookupError(f"--input expects KEY=VALUE, got '{p}'")
+        out[k.strip()] = v
+    return out
+
+
+def _aws_inputs(lab: Dict[str, Any], args) -> Dict[str, str]:
+    """Fill the inputs a lab declares in ``student_inputs[].type``.
+
+    Only ``allowed_ip`` exists today — it scopes the lab's security group
+    to a single address. The status payload's own ``suggested_ip`` is the
+    egress address HackSmarter sees us coming from, which beats asking a
+    third party, so we only fall back to an external lookup when it's
+    missing. ``--allowed-ip`` wins over both (useful when the traffic will
+    come from somewhere else, e.g. a jump box).
+    """
+    supplied = _parse_kv(getattr(args, "input", None))
+    inputs: Dict[str, str] = {}
+    for si in (lab.get("student_inputs") or []):
+        key = str((si or {}).get("type") or "") if isinstance(si, dict) else ""
+        if not key:
+            continue
+        if key in supplied:
+            inputs[key] = supplied.pop(key)
+            continue
+        if key == "allowed_ip":
+            ip = (getattr(args, "allowed_ip", None) or lab.get("suggested_ip")
+                  or detect_public_ip())
+            if not ip:
+                raise LookupError(
+                    "couldn't determine your public IP — pass --allowed-ip <ip>"
+                )
+            inputs[key] = ip
+        else:
+            raise LookupError(
+                f"this lab requires the input '{key}' — pass --input {key}=<value>"
+            )
+    inputs.update(supplied)  # anything extra the caller insisted on
+    return inputs
+
+
+def _cmd_lab_launch_aws(api: HackSmarterAPI, config: Config, args,
+                        course_id: str) -> int:
+    import time
+    fmt = _format_choice(args, config)
+    lab = _resolve_aws_lab(api, course_id, getattr(args, "system", None))
+    lab_id = lab["aws_lab_id"]
+    label = lab.get("name") or lab_id
+
+    if _aws_state(lab) in AWS_READY_STATES:
+        print_info(f"{label} is already running.")
+        if fmt in ("json", "yaml"):
+            print_output(lab, fmt)
+            return 0
+        _render_aws_creds(lab)
+        print_info("Use `reset` for a fresh environment, `extend` for more time.")
+        return 0
+
+    inputs = _aws_inputs(lab, args)
+    if inputs.get("allowed_ip"):
+        print_info(f"allowed_ip: {inputs['allowed_ip']}"
+                   + ("" if getattr(args, "allowed_ip", None)
+                      else "  (server-suggested — override with --allowed-ip)"))
+
+    data = api.aws_lab_power(course_id, lab_id, "start", inputs)
+    if not args.wait:
+        if fmt in ("json", "yaml"):
+            print_output(data, fmt)
+            return 0
+        print_success(f"Start requested for {label}")
+        print_info(f"Terraform takes a couple of minutes. Poll with "
+                   f"`hsmcli lab {args.identifier} status`.")
+        return 0
+
+    print_success(f"Start requested for {label}")
+    deadline = time.monotonic() + args.timeout
+    last_state = _aws_state(lab)
+    console.print()
+    console.print(f"[dim]Waiting for terraform to apply (timeout {args.timeout}s)…[/dim]")
+
+    while time.monotonic() < deadline:
+        try:
+            lab = {**api.get_aws_lab(course_id, lab_id), "aws_lab_id": lab_id}
+            state = _aws_state(lab)
+        except Exception as e:
+            lab = {"aws_lab_id": lab_id, "state": "unknown", "error_message": str(e)}
+            state = "poll-error"
+
+        if state != last_state:
+            console.print(f"  [dim]{time.strftime('%H:%M:%S')}[/dim]  ", end="")
+            console.print(_badge(state, STATE_STYLE))
+            last_state = state
+
+        if state in AWS_READY_STATES:
+            if fmt in ("json", "yaml"):
+                print_output(lab, fmt)
+                return 0
+            console.print(f"[green]✓ {label} is ready.[/green]")
+            if not _render_aws_creds(lab):
+                print_warning("Lab is ready but returned no terraform outputs.")
+            return 0
+        if state in AWS_FAILED_STATES:
+            console.print(f"[red]✗ start failed: {state}[/red]")
+            if lab.get("error_message"):
+                print_error(str(lab["error_message"]))
+            return 1
+
+        time.sleep(5)
+
+    print_warning(f"timeout after {args.timeout}s — last state: {last_state}")
+    print_info(f"It may still finish. Poll with `hsmcli lab {args.identifier} status`.")
+    return 2
+
+
+def _cmd_lab_aws_action(api: HackSmarterAPI, config: Config, args,
+                        course_id: str, action: str) -> int:
+    """stop / reset / extend for an AWS lab, then show the fresh status."""
+    fmt = _format_choice(args, config)
+    lab = _resolve_aws_lab(api, course_id, getattr(args, "system", None))
+    lab_id = lab["aws_lab_id"]
+    label = lab.get("name") or lab_id
+
+    # `reset` tears the environment down and re-applies, so it needs the
+    # same inputs `start` did; stop/extend don't take any.
+    inputs = _aws_inputs(lab, args) if action == "reset" else None
+    data = api.aws_lab_power(course_id, lab_id, action, inputs)
+    if fmt in ("json", "yaml"):
+        print_output(data, fmt)
+        return 0
+
+    verb = {"stop": "Stopped", "reset": "Reset", "extend": "Extended"}[action]
+    print_success(f"{verb} AWS lab {label}")
+    try:
+        fresh = {**api.get_aws_lab(course_id, lab_id), "aws_lab_id": lab_id}
+    except Exception as e:
+        console.print(f"[dim]status poll failed: {e}[/dim]")
+        return 0
+    _render_aws_table([fresh], title="Status")
+    if action in ("reset", "extend"):
+        _render_aws_creds(fresh)
+    if action == "reset":
+        print_info(f"Re-provisioning takes a couple of minutes — poll with "
+                   f"`hsmcli lab {args.identifier} status`.")
+    return 0
+
+
+def cmd_lab_creds(api: HackSmarterAPI, config: Config, args) -> int:
+    """Print an AWS lab's IAM credentials (terraform outputs)."""
+    fmt = _format_choice(args, config)
+    course_id = resolve_course_id(api, args.identifier)
+    if api.lab_kind(course_id) != "aws":
+        print_error("This lab isn't an AWS lab — try `systems` / `vpn` instead.")
+        return 2
+    lab = _resolve_aws_lab(api, course_id, args.system)
+    outputs = lab.get("terraform_outputs") or {}
+
+    if args.export:
+        # stdout must stay eval-able: warnings go to stderr, nothing else
+        # is printed.
+        if not outputs:
+            print_error(f"No credentials — lab state is '{_aws_state(lab)}'. "
+                        f"Launch it first.")
+            return 1
+        for line in _aws_env_exports(outputs):
+            print(line)
+        return 0
+    if fmt in ("json", "yaml"):
+        print_output(outputs or lab, fmt)
+        return 0
+    if not _render_aws_creds(lab):
+        print_warning(f"No credentials yet — lab state is '{_aws_state(lab)}'. "
+                      f"Run `hsmcli lab {args.identifier} launch`.")
+        return 1
+    return 0
+
+
+def cmd_lab_extend(api: HackSmarterAPI, config: Config, args) -> int:
+    course_id = resolve_course_id(api, args.identifier)
+    if api.lab_kind(course_id) != "aws":
+        print_error("`extend` only applies to AWS labs.")
+        return 2
+    return _cmd_lab_aws_action(api, config, args, course_id, "extend")
+
+
 QUESTION_STATE_STYLE = {
     "correct": "green",
     "incorrect": "red",
     "attempted": "yellow",
     "not_attempted": "dim",
+    "unanswered": "dim",
 }
 
 
@@ -811,6 +1322,49 @@ def _match_question(
     raise LookupError(f"no question matching '{selector}'")
 
 
+def _submission_verdict(data: Any) -> Tuple[Optional[bool], Optional[str]]:
+    """Pull ``(correct, server-accepted answer)`` out of a submit reply.
+
+    The live endpoint answers
+    ``{"result": {"is_correct": true, "answer_text": "hsm{…}"}}`` — the
+    verdict is nested and the key is ``is_correct``, not ``correct``. Older
+    payloads used a flat ``{"correct", "matchedAnswer"}``, so both shapes are
+    accepted. ``correct`` comes back ``None`` when no verdict key is found
+    anywhere: an unrecognised reply must not silently read as "incorrect".
+    """
+    if not isinstance(data, dict):
+        return None, None
+
+    scopes: List[Dict[str, Any]] = [data]
+    for key in ("result", "data", "attempt"):
+        inner = data.get(key)
+        if isinstance(inner, dict):
+            scopes.append(inner)
+            nested = inner.get("result")
+            if isinstance(nested, dict):
+                scopes.append(nested)
+
+    correct: Optional[bool] = None
+    answer: Optional[str] = None
+    for scope in scopes:
+        if correct is None:
+            for k in ("is_correct", "isCorrect", "correct"):
+                v = scope.get(k)
+                if isinstance(v, bool):
+                    correct = v
+                    break
+        if answer is None:
+            matched = scope.get("matchedAnswer")
+            candidates = [scope.get(k) for k in ("answer_text", "answerText")]
+            if isinstance(matched, dict):
+                candidates.append(matched.get("answer"))
+            for v in candidates:
+                if isinstance(v, str) and v.strip():
+                    answer = v
+                    break
+    return correct, answer
+
+
 def cmd_lab_submit(api: HackSmarterAPI, config: Config, args) -> int:
     fmt = _format_choice(args, config)
     course_id = resolve_course_id(api, args.identifier)
@@ -835,7 +1389,6 @@ def cmd_lab_submit(api: HackSmarterAPI, config: Config, args) -> int:
 
     data = api.submit_question(
         course_id=course_id,
-        content_id=q["content_id"],
         lesson_id=q["lesson_id"],
         question_id=q["question_id"],
         submission=args.value,
@@ -844,20 +1397,28 @@ def cmd_lab_submit(api: HackSmarterAPI, config: Config, args) -> int:
     if fmt in ("json", "yaml"):
         print_output(data, fmt); return 0
 
-    correct = bool(data.get("correct")) if isinstance(data, dict) else False
+    correct, answer = _submission_verdict(data)
     prompt_short = truncate(q.get("prompt") or "?", 60)
+    if correct is None:
+        # Never report an unparsed reply as a wrong flag — show it instead.
+        print_warning(f"unrecognised server reply — {prompt_short}")
+        print_json(data)
+        return 1
     if correct:
-        print_success(f"✓ correct — {prompt_short}  ({q.get('points') or '?'} pts)")
-        matched = (data.get("matchedAnswer") or {}) if isinstance(data, dict) else {}
-        answer = matched.get("answer") if isinstance(matched, dict) else None
-        if answer and answer != args.value:
+        print_success(f"correct — {prompt_short}  ({q.get('points') or '?'} pts)")
+        # The server echoes its own canonical casing; only worth showing when
+        # it differs by more than case/whitespace.
+        if answer and answer.strip().lower() != (args.value or "").strip().lower():
             print_info(f"server-accepted answer: {answer}")
     else:
-        print_error(f"✗ incorrect — {prompt_short}")
-        if isinstance(data, dict):
-            # Server sometimes echoes hints or attempt counters.
+        print_error(f"incorrect — {prompt_short}")
+        # Server sometimes echoes hints or attempt counters, flat or nested.
+        result = data.get("result") if isinstance(data, dict) else None
+        for scope in (data, result):
+            if not isinstance(scope, dict):
+                continue
             for k in ("hint", "attempts_remaining", "message"):
-                v = data.get(k)
+                v = scope.get(k)
                 if v:
                     print_info(f"  {k}: {v}")
     return 0 if correct else 1
@@ -953,11 +1514,15 @@ def build_parser() -> argparse.ArgumentParser:
     # labs
     pls = sp.add_parser("labs", help="lab catalog operations")
     lsub = pls.add_subparsers(dest="subcommand")
-    _ll = lsub.add_parser("list", help="list labs (default: catalog)")
+    _ll = lsub.add_parser(
+        "list", help="list challenge labs (-c all for every category)")
     _ll.add_argument("-s", "--search", default="",
                      help="substring filter on name/description")
-    _ll.add_argument("-e", "--enrolled", action="store_true",
-                     help="show only labs the current user is enrolled in")
+    _src = _ll.add_mutually_exclusive_group()
+    _src.add_argument("-e", "--enrolled", action="store_true",
+                      help="only /courses (the labs on your account)")
+    _src.add_argument("--catalog", action="store_true",
+                      help="only /catalog (the storefront cards, incl. bundles)")
     _ll.add_argument("-d", "--difficulty", action="append", default=[],
                      choices=["easy", "medium", "hard", "insane"],
                      help="filter by difficulty (repeatable, e.g. -d easy -d medium)")
@@ -966,9 +1531,10 @@ def build_parser() -> argparse.ArgumentParser:
                               "not_started", "unowned", "lapsed"],
                      help="filter by state (repeatable)")
     _ll.add_argument("-c", "--category", action="append", default=[],
-                     choices=["challenge", "guided", "range", "hackwith",
-                              "foundations", "other"],
-                     help="filter by lab category (repeatable)")
+                     choices=["all", "challenge", "guided", "range",
+                              "hackwith", "foundations", "other"],
+                     help="filter by lab category (repeatable; "
+                          "default: challenge, 'all' to widen)")
     _ll.add_argument("--sort", choices=["name", "difficulty", "state"],
                      default=None, help="sort results")
     _add_format_flags(_ll)
@@ -984,8 +1550,16 @@ def build_parser() -> argparse.ArgumentParser:
     pl.add_argument("identifier", help="course UUID or (unique) name substring")
     lsub2 = pl.add_subparsers(dest="subcommand", required=True,
                               metavar="ACTION")
+    _lif = lsub2.add_parser(
+        "info", help="show lab metadata, briefing and live system status")
+    _lif.add_argument("--full", action="store_true",
+                      help=f"render every lesson's content "
+                           f"(default: first {BRIEFING_LESSON_LIMIT})")
+    _lif.add_argument("--no-briefing", action="store_true",
+                      help="skip lesson content (metadata only)")
+    _add_format_flags(_lif)
+
     for name, help_text in [
-        ("info", "show lab metadata (with live system status)"),
         ("take", "show take/enroll info"),
         ("enroll", "enroll in the lab"),
         ("systems", "list systems (machines) in the lab with live status"),
@@ -993,25 +1567,48 @@ def build_parser() -> argparse.ArgumentParser:
     ]:
         _add_format_flags(lsub2.add_parser(name, help=help_text))
 
-    _lch = lsub2.add_parser("launch", help="launch (start) a system in the lab")
+    def _add_aws_input_flags(sub):
+        """Flags for the values an AWS lab asks for at start/reset time."""
+        sub.add_argument("--allowed-ip",
+                         help="AWS lab: IP allowed to reach the lab "
+                              "(default: the address HackSmarter sees you from)")
+        sub.add_argument("--input", action="append", default=[], metavar="KEY=VALUE",
+                         help="AWS lab: extra student input (repeatable)")
+
+    _lch = lsub2.add_parser("launch", help="launch (start) a system / AWS lab")
     _lch.add_argument("system", nargs="?",
-                      help="system UUID or name (optional if lab has only one)")
+                      help="system or AWS-lab UUID/name (optional if there's only one)")
     _lch.add_argument("--no-wait", dest="wait", action="store_false",
                       default=True,
                       help="don't poll after launch — return as soon as /power ACKs")
     _lch.add_argument("--timeout", type=int, default=420,
                       help="max seconds to wait when polling (default 420 = 7 min)")
+    _add_aws_input_flags(_lch)
     _add_format_flags(_lch)
 
-    _lst = lsub2.add_parser("stop", help="power off a running system in the lab")
+    _lst = lsub2.add_parser("stop", help="power off a running system / AWS lab")
     _lst.add_argument("system", nargs="?",
-                      help="system UUID or name (optional if lab has only one)")
+                      help="system or AWS-lab UUID/name (optional if there's only one)")
     _add_format_flags(_lst)
 
-    _lrs = lsub2.add_parser("reset", help="reboot (reset) a running system in the lab")
+    _lrs = lsub2.add_parser(
+        "reset", help="reboot a system / re-provision an AWS lab")
     _lrs.add_argument("system", nargs="?",
-                      help="system UUID or name (optional if lab has only one)")
+                      help="system or AWS-lab UUID/name (optional if there's only one)")
+    _add_aws_input_flags(_lrs)
     _add_format_flags(_lrs)
+
+    _lcr = lsub2.add_parser("creds", help="AWS lab: show the IAM credentials")
+    _lcr.add_argument("system", nargs="?",
+                      help="AWS-lab UUID or name (optional if there's only one)")
+    _lcr.add_argument("--export", action="store_true",
+                      help="print `export AWS_…=` lines for eval")
+    _add_format_flags(_lcr)
+
+    _lex = lsub2.add_parser("extend", help="AWS lab: extend the time limit")
+    _lex.add_argument("system", nargs="?",
+                      help="AWS-lab UUID or name (optional if there's only one)")
+    _add_format_flags(_lex)
 
     _lvpn = lsub2.add_parser("vpn", help="download the OpenVPN config for the lab")
     _lvpn.add_argument("-o", "--output", help="output file (default ./hsm-<id>.ovpn)")
@@ -1109,6 +1706,8 @@ def main() -> int:
                 "launch": cmd_lab_launch,
                 "stop": cmd_lab_stop,
                 "reset": cmd_lab_reset,
+                "creds": cmd_lab_creds,
+                "extend": cmd_lab_extend,
                 "vpn": cmd_lab_vpn,
                 "image": cmd_lab_image,
                 "flags": cmd_lab_flags,
