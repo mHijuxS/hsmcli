@@ -59,6 +59,21 @@ def detect_public_ip(timeout: float = 5.0) -> Optional[str]:
     return None
 
 
+def _take_course(take_payload: Any) -> Dict[str, Any]:
+    """The ``course`` object inside a /take payload, or ``{}``.
+
+    /take is normally ``{"course": {...}, "static_aws_labs": [...]}``, but
+    an error or partial response can carry ``{"course": null}`` — and a bare
+    ``.get("course", payload)`` hands that None straight to the caller. That
+    crashed ``extract_lessons`` and cascaded through ``extract_aws_labs``
+    into every lifecycle command, so normalize it here.
+    """
+    if not isinstance(take_payload, dict):
+        return {}
+    body = take_payload.get("course", take_payload)
+    return body if isinstance(body, dict) else {}
+
+
 def parse_cookie_header(raw: str) -> Dict[str, str]:
     """Parse a browser ``Cookie:`` header into ``{name: value}``.
 
@@ -755,10 +770,7 @@ class HackSmarterAPI:
         Only /take carries these; ``GET /courses/{id}`` returns lessons
         as bare name/slug stubs.
         """
-        body = (
-            take_payload.get("course", take_payload)
-            if isinstance(take_payload, dict) else {}
-        )
+        body = _take_course(take_payload)
         out: List[Dict[str, Any]] = []
         for ch in (body.get("chapters") or []):
             if not isinstance(ch, dict):
@@ -789,10 +801,7 @@ class HackSmarterAPI:
         the fields callers need to submit and render — ``content_id`` and
         ``lesson_id`` come from the enclosing lesson wrapper, not the item.
         """
-        body = (
-            take_payload.get("course", take_payload)
-            if isinstance(take_payload, dict) else {}
-        )
+        body = _take_course(take_payload)
         out: List[Dict[str, Any]] = []
         for ch in (body.get("chapters") or []):
             if not isinstance(ch, dict):

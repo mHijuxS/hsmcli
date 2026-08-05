@@ -30,7 +30,12 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from .api_client import HackSmarterAPI, detect_public_ip
+from .api_client import (
+    AUTH_COOKIE_BASE,
+    HackSmarterAPI,
+    detect_public_ip,
+    parse_cookie_header,
+)
 from .config import Config
 from .resolvers import (
     _extract_items,
@@ -131,8 +136,29 @@ def cmd_config_set_cookie(config: Config, args) -> int:
     cookie = args.cookie
     if cookie == "-":
         cookie = sys.stdin.read()
+
+    # Validate before storing. A bare token pasted without its `name=` used
+    # to save fine and then fail every call with "cookie may be expired",
+    # which sends you looking in the wrong place.
+    parsed = parse_cookie_header(cookie)
+    if not parsed:
+        print_error(
+            "That doesn't look like a Cookie header — expected 'name=value' "
+            "pairs separated by ';'. Copy the whole header from devtools → "
+            "Network → any request → Request Headers → Cookie."
+        )
+        return 2
+    chunks = sum(1 for k in parsed if k.startswith(AUTH_COOKIE_BASE))
+    if not chunks:
+        # Don't hard-fail: the cookie name is HackSmarter's to change, and a
+        # user who knows better shouldn't be blocked by our expectations.
+        print_warning(
+            f"No '{AUTH_COOKIE_BASE}.N' cookie in that header — auth will "
+            f"likely fail. Saving anyway."
+        )
     config.set_cookie(cookie)
-    print_success("Cookie saved.")
+    print_success(f"Cookie saved ({len(parsed)} cookie(s), "
+                  f"{chunks} auth chunk(s)).")
     return 0
 
 
@@ -1656,7 +1682,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
-    config = Config(getattr(args, "config_dir", None))
+    try:
+        config = Config(getattr(args, "config_dir", None))
+    except (ValueError, OSError) as e:
+        print_error(str(e))
+        return 1
 
     if not args.command:
         parser.print_help()

@@ -211,6 +211,25 @@ Keys:
 
 Env vars: `HSMCLI_COOKIE` overrides the stored cookie.
 
+The config file holds your whole Supabase session — access token *and*
+refresh token — so it is created `0600` inside a `0700` directory, and a
+looser mode left by an earlier version is tightened on next run. Treat it
+like an SSH key.
+
+## Tests
+
+```bash
+uv run --with pytest --with rich --with requests --with pyyaml pytest
+# or, in an env with the package installed:
+pip install -e '.[dev]' && pytest
+```
+
+The suite covers the payload-shape layer — the id/name/state extractors,
+the `/take` scrapers, cookie and session decoding, identifier resolution,
+the two-endpoint merge, and config file permissions. Those are the parts
+that break silently when HackSmarter changes a response, so they're worth
+keeping green.
+
 ## Requirements
 
 Python 3.8+, `requests`, `PyYAML`, `rich`.

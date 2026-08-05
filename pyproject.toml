@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "HackSmarter CLI — manage labs, systems, and VPN from the terminal"
 readme = "README.md"
 license = {text = "MIT"}
-authors = [{name = "hsmcli"}]
+authors = [{name = "mHijuxS"}]
 keywords = ["hacksmarter", "cli", "ctf", "security", "labs"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -30,8 +30,19 @@ dependencies = [
     "rich>=13.0.0",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.urls]
+Homepage = "https://github.com/mHijuxS/hsmcli"
+Repository = "https://github.com/mHijuxS/hsmcli"
+Issues = "https://github.com/mHijuxS/hsmcli/issues"
+
 [project.scripts]
 hsmcli = "hsmcli:main"
 
 [tool.setuptools]
 packages = ["hsmcli"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
