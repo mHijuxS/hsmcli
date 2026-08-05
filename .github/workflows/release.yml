@@ -1,0 +1,55 @@
+# Builds a release and attaches the artifacts. Deliberately NOT wired to
+# PyPI and NOT triggered by pushes or tags: the repo is private and no
+# decision has been made about publishing. This exists so the release path
+# is exercised and reviewable before that decision, and it cannot upload
+# anything anywhere.
+#
+# To publish later: add a job with `permissions: id-token: write`, a `pypi`
+# environment, and pypa/gh-action-pypi-publish using Trusted Publishing —
+# no API token needed. Reserve the name first (`hsmcli` was unclaimed on
+# 2026-08-05).
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build (must match pyproject.toml)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+
+      - name: Check the tag matches pyproject
+        run: |
+          declared=$(python -c "import tomllib,pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
+          if [ "$declared" != "${{ inputs.version }}" ]; then
+            echo "pyproject says $declared, you asked for ${{ inputs.version }}" >&2
+            exit 1
+          fi
+          echo "version $declared"
+
+      - run: pip install build twine
+      - run: python -m build
+      - run: twine check dist/*
+
+      - name: The sdist must carry a runnable test suite
+        run: |
+          mkdir -p /tmp/sdist && tar xzf dist/*.tar.gz -C /tmp/sdist --strip-components=1
+          cd /tmp/sdist
+          pip install '.[dev]'
+          pytest -q
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hsmcli-${{ inputs.version }}
+          path: dist/*

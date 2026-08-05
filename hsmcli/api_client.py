@@ -9,6 +9,7 @@ friends) is optional analytics noise.
 """
 
 import base64
+import ipaddress
 import json
 import os
 import re
@@ -17,6 +18,43 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin
 
 import requests
+
+
+# ── errors ────────────────────────────────────────────────────────────────
+# Everything below subclasses Exception, so the CLI's catch-all handlers and
+# the `except Exception` fallbacks in resolvers keep working unchanged. The
+# point is that a caller importing this module can now tell an expired
+# cookie from a 404 without matching on message text.
+
+class HsmcliError(Exception):
+    """Base class for every error this client raises."""
+
+
+class AuthError(HsmcliError):
+    """401 — the session cookie is missing, expired, or rejected."""
+
+
+class ForbiddenError(HsmcliError):
+    """403 — usually "not enrolled yet" rather than a real permission issue."""
+
+
+class NotEnrolledError(HsmcliError):
+    """No playthrough for this course yet, so lifecycle ids don't exist."""
+
+
+class APIError(HsmcliError):
+    """A non-2xx response that isn't 401/403."""
+
+    def __init__(self, message: str, status: Optional[int] = None,
+                 endpoint: Optional[str] = None, body: str = ""):
+        super().__init__(message)
+        self.status = status
+        self.endpoint = endpoint
+        self.body = body
+
+
+class TransportError(HsmcliError):
+    """The request never completed — DNS, TLS, timeout, connection reset."""
 
 
 AUTH_COOKIE_BASE = "sb-auth-auth-token"
@@ -77,8 +115,11 @@ def detect_public_ip(timeout: float = 5.0) -> Optional[str]:
             r = requests.get(url, timeout=timeout)
             r.raise_for_status()
             ip = r.text.strip()
-            if re.fullmatch(r"[0-9A-Fa-f:.]{7,45}", ip):
-                return ip
+            # Validate properly: the old character-class regex accepted
+            # '.......', '::::::::' and '999.999.999.999', any of which would
+            # be sent on to the API as an AWS lab's allowed_ip.
+            ipaddress.ip_address(ip)
+            return ip
         except Exception:
             continue
     return None
@@ -253,7 +294,7 @@ class HackSmarterAPI:
             code = e.response.status_code if e.response is not None else "?"
             body = e.response.text[:400] if e.response is not None else ""
             if code == 401:
-                raise Exception(
+                raise AuthError(
                     "Authentication failed (401). Cookie may be expired. "
                     "Update it with: hsmcli config set-cookie '<paste cookie header>' "
                     "or export HSMCLI_COOKIE."
@@ -266,10 +307,13 @@ class HackSmarterAPI:
                 # endpoints serve data), so point at it directly.
                 m = re.search(r"/courses/([0-9a-fA-F-]{36})", endpoint)
                 hint = f" Not enrolled? Try: hsmcli lab {m.group(1)} enroll" if m else ""
-                raise Exception(f"HTTP 403 (forbidden) on {method_up} {endpoint}: {body}.{hint}")
-            raise Exception(f"HTTP {code} on {method_up} {endpoint}: {body}")
+                raise ForbiddenError(
+                    f"HTTP 403 (forbidden) on {method_up} {endpoint}: {body}.{hint}")
+            raise APIError(f"HTTP {code} on {method_up} {endpoint}: {body}",
+                           status=code if isinstance(code, int) else None,
+                           endpoint=endpoint, body=body)
         except requests.exceptions.RequestException as e:
-            raise Exception(f"Request failed: {e}")
+            raise TransportError(f"Request failed: {e}")
 
     # ── session ───────────────────────────────────────────────────────────
     def session_summary(self) -> Optional[Dict[str, Any]]:
@@ -657,7 +701,7 @@ class HackSmarterAPI:
         pt = self._ensure_playthrough(course_id)
         playthrough_id = pt["playthrough_id"]
         if not playthrough_id:
-            raise Exception("no active playthrough — enroll first")
+            raise NotEnrolledError("no active playthrough — enroll first")
         return f"/api/student/content/{playthrough_id}/aws-labs"
 
     def get_aws_lab(self, course_id: str, aws_lab_id: str) -> Dict[str, Any]:
@@ -748,7 +792,7 @@ class HackSmarterAPI:
         if pt["kind"] == "networks":
             net_ids = pt["network_ids"]
             if not net_ids:
-                raise Exception("lab has no networks")
+                raise HsmcliError("lab has no networks")
             # Multi-network labs would need explicit selection; for now
             # take the first — the VPN is usually shared per lab.
             path = f"/api/student/courses/{playthrough_id}/networks/{net_ids[0]}/vpn"
@@ -803,7 +847,7 @@ class HackSmarterAPI:
         pt = self._ensure_playthrough(course_id)
         playthrough_id = pt["playthrough_id"]
         if not playthrough_id:
-            raise Exception("no active playthrough — enroll first")
+            raise NotEnrolledError("no active playthrough — enroll first")
         real_course_id = pt["course_id"] or course_id
         take_referer = f"{self.base_url}/courses/{real_course_id}/take"
         return self._power_call(
@@ -908,7 +952,7 @@ class HackSmarterAPI:
         """
         pt = self._ensure_playthrough(course_id)
         if not (pt["lesson_id"] and pt["playthrough_id"]):
-            raise Exception("no active playthrough/lesson — enroll first")
+            raise NotEnrolledError("no active playthrough/lesson — enroll first")
         return self.heartbeat({
             "lessonId": pt["lesson_id"],
             "courseId": pt["course_id"] or course_id,

@@ -1495,6 +1495,19 @@ def cmd_lab_image(api: HackSmarterAPI, config: Config, args) -> int:
 
 # ── misc ──────────────────────────────────────────────────────────────────
 
+def _need_subcommand(command: str, actions) -> int:
+    """Report a command invoked without a valid action, and exit 2.
+
+    The old path called ``parser.parse_args([command, "--help"])``, which
+    raises ``SystemExit(0)`` — so the ``return 2`` beneath it was dead code
+    and `hsmcli labs` looked *successful* to a script.
+    """
+    print_error(f"`hsmcli {command}` needs an action: "
+                + " | ".join(sorted(actions)))
+    print_info(f"See `hsmcli {command} --help`.")
+    return 2
+
+
 def _simple_get(api_fn, args, config: Config) -> int:
     fmt = _format_choice(args, config)
     data = api_fn()
@@ -1704,8 +1717,7 @@ def main() -> int:
         }
         fn = table.get(args.subcommand)
         if not fn:
-            parser.parse_args([args.command, "--help"])
-            return 2
+            return _need_subcommand("config", table)
         try:
             return fn(config, args)
         except Exception as e:
@@ -1725,7 +1737,7 @@ def main() -> int:
         if args.command == "labs":
             if args.subcommand == "list":
                 return cmd_labs_list(api, config, args)
-            parser.parse_args(["labs", "--help"]); return 2
+            return _need_subcommand("labs", ["list"])
         if args.command == "lab":
             table = {
                 "info": cmd_lab_info,
@@ -1745,7 +1757,7 @@ def main() -> int:
             }
             fn = table.get(args.subcommand)
             if not fn:
-                parser.parse_args(["lab", "--help"]); return 2
+                return _need_subcommand("lab <identifier>", table)
             return fn(api, config, args)
         if args.command == "notifications":
             return _simple_get(api.get_notifications, args, config)

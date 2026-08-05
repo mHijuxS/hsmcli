@@ -1,0 +1,13 @@
+# setuptools' legacy sdist default only matches `test*/test*.py`, which
+# picked up the test modules but silently dropped tests/conftest.py — every
+# test file imports it, so the published sdist shipped a suite that couldn't
+# run. Be explicit instead.
+recursive-include tests *.py
+include LICENSE
+include README.md
+include CHANGELOG.md
+
+# Build leftovers that have no business in a source distribution.
+prune build
+prune dist
+global-exclude *.py[cod] __pycache__/*

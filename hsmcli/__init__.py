@@ -1,6 +1,14 @@
 """HackSmarter CLI package."""
 
-from .api_client import client_version
+from .api_client import (
+    APIError,
+    AuthError,
+    ForbiddenError,
+    HsmcliError,
+    NotEnrolledError,
+    TransportError,
+    client_version,
+)
 from .cli import main
 
 # Read from the installed distribution rather than hardcoded here, so
@@ -8,4 +16,14 @@ from .cli import main
 __version__ = client_version()
 __author__ = "mHijuxS"
 
-__all__ = ["main", "__version__"]
+__all__ = [
+    "main",
+    "__version__",
+    # Catch these when using hsmcli as a library; all subclass HsmcliError.
+    "HsmcliError",
+    "AuthError",
+    "ForbiddenError",
+    "NotEnrolledError",
+    "APIError",
+    "TransportError",
+]

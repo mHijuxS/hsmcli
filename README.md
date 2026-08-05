@@ -254,6 +254,42 @@ that need it), so there's nothing to work around. If that ever changes,
 `HSMCLI_USER_AGENT` takes any string, and `hsmcli.api_client
 .BROWSER_USER_AGENT` holds a browser one.
 
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | success |
+| 1 | the request failed (auth, HTTP error, network) |
+| 2 | your invocation was wrong — bad/missing action, ambiguous name, no match |
+
+`launch --wait` returns 2 on timeout as well: the machine may still be
+coming up, so it isn't a failure.
+
+## Using it as a library
+
+`hsmcli` is a CLI first, but the client is importable. Errors are typed, so
+you don't have to match on message text:
+
+```python
+from hsmcli import AuthError, HsmcliError
+from hsmcli.api_client import HackSmarterAPI
+from hsmcli.config import Config
+from hsmcli.resolvers import all_lab_items, resolve_course_id
+
+api = HackSmarterAPI(Config())
+try:
+    labs = all_lab_items(api)
+    cid = resolve_course_id(api, "odyssey")
+except AuthError:
+    ...   # cookie expired
+except HsmcliError:
+    ...   # anything else this client raises
+```
+
+`HsmcliError` is the base; `AuthError` (401), `ForbiddenError` (403),
+`NotEnrolledError`, `APIError` (carries `.status`, `.endpoint`, `.body`) and
+`TransportError` derive from it. All subclass `Exception`.
+
 ## Tests
 
 ```bash
@@ -272,6 +308,22 @@ keeping green.
 
 Python 3.9+, `requests`, `PyYAML`, `rich`. CI tests 3.9 through 3.14.
 
+## Releasing
+
+Not published to any index yet — the repo is private while the ToS question
+above is open. The path is prepared, though:
+
+1. Bump `version` in `pyproject.toml` and add a `CHANGELOG.md` entry.
+2. `git tag -a vX.Y.Z -m "…" && git push --tags`
+3. Run the **release** workflow (manual dispatch only) with the same version.
+   It builds, runs `twine check`, unpacks the sdist and runs the test suite
+   from *inside* it, then attaches the artifacts.
+
+The workflow deliberately has no PyPI step, so nothing can be uploaded by
+accident. Adding one later means a job with Trusted Publishing — see the
+comment at the top of `.github/workflows/release.yml`. The name `hsmcli` was
+unclaimed on PyPI as of 2026-08-05.
+
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
