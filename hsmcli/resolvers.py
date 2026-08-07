@@ -47,8 +47,9 @@ def _item_id(item: Dict[str, Any]) -> Optional[str]:
     Networks-lab status wrappers expose ``course_network_id`` — that's
     the id the /power endpoint accepts. AWS-lab status entries carry
     ``aws_lab_id`` (the payload has no ``id`` of its own). Systems-lab
-    status wrappers use top-level ``id``. Prefer the most-specific /
-    most-actionable key first.
+    status wrappers use top-level ``id``. The machines *inside* a
+    networks wrapper key theirs as ``systemId``. Prefer the most-specific
+    / most-actionable key first.
     """
     nested = item.get("item")
     if isinstance(nested, dict):
@@ -56,7 +57,7 @@ def _item_id(item: Dict[str, Any]) -> Optional[str]:
         if isinstance(v, str) and v:
             return v
     for k in ("course_network_id", "course_system_id", "aws_lab_id",
-              "course_id", "system_id", "network_id",
+              "course_id", "system_id", "systemId", "network_id",
               "uuid", "id", "_id"):
         v = item.get(k)
         if isinstance(v, str) and v:

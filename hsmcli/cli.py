@@ -661,34 +661,78 @@ def cmd_lab_enroll(api: HackSmarterAPI, config: Config, args) -> int:
     return 0
 
 
+def _network_machines(item: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The machines inside a networks-lab wrapper, or ``[]`` for a leaf.
+
+    The live payload puts them flat on the wrapper::
+
+        {"id": …, "name": "Odyssey", "systems": [
+            {"systemId": …, "name": "DC-01", "state": "running",
+             "ip": "10.1.77.132", "hostname": "DC-01"}, …]}
+
+    A ``network: {systems: […]}`` nesting is also accepted — that's the
+    shape this code was originally written against, and cheap to keep.
+    """
+    for holder in (item.get("network"), item):
+        if isinstance(holder, dict) and isinstance(holder.get("systems"), list):
+            kids = [s for s in holder["systems"] if isinstance(s, dict)]
+            if kids:
+                return kids
+    return []
+
+
 def _flatten_lab_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Normalize systems-lab and networks-lab payloads to a flat machine list.
 
-    Networks payload shape:
-        [{course_network_id, network: {name, state, systems: [{id, name,
-         state, ip_address, hostname, ...}]}}]
-    Systems payload shape:
-        [{id, system: {name, state, ip, ...}}]
+    Networks payload: one wrapper per network, machines in ``systems[]``
+    (see ``_network_machines``).
+    Systems payload:  ``[{id, system: {name, state, ip, ...}}]``
 
     For rendering we want a single flat list of "machines" with a common
-    shape. Networks entries expand to their inner ``systems[]``; systems
-    entries pass through unchanged.
+    shape. Networks entries expand to their inner machines; systems entries
+    pass through unchanged.
     """
     out: List[Dict[str, Any]] = []
     for it in items:
-        net = it.get("network")
-        if isinstance(net, dict) and isinstance(net.get("systems"), list):
-            for s in net["systems"]:
-                if isinstance(s, dict):
-                    # Copy so we can attach the parent-network name for
-                    # multi-network labs — harmless when there's just one.
-                    out.append({**s, "_network": net.get("name")})
+        machines = _network_machines(it)
+        if machines:
+            net = it.get("network")
+            net_name = (net if isinstance(net, dict) else it).get("name")
+            for s in machines:
+                # Copy so we can attach the parent-network name for
+                # multi-network labs — harmless when there's just one.
+                out.append({**s, "_network": net_name})
             continue
         out.append(it)
     return out
 
 
+# Worst-first ordering used to fold a network's machines into one state:
+# a network is only "running" once every machine in it is. Unknown states
+# sort mid-pack so a state we've never seen can't masquerade as ready.
+_STATE_RANK = {
+    "error": 0, "failed": 0,
+    "not_launched": 1, "stopped": 2, "stopping": 2,
+    "pending": 4, "provisioning": 4, "starting": 4,
+    "running": 6, "ready": 6, "active": 6,
+}
+_UNKNOWN_STATE_RANK = 3
+
+
+def _aggregate_status(states: List[str]) -> str:
+    """Fold several machine states into the one a network reports."""
+    if not states:
+        return "not_launched"
+    return min(states, key=lambda s: (_STATE_RANK.get(s, _UNKNOWN_STATE_RANK), s))
+
+
 def _system_status(item: Dict[str, Any]) -> str:
+    # A networks-lab wrapper has no state of its own — only its machines do
+    # — so derive it. Without this the wrapper hit the "not_launched"
+    # default below and `launch --wait` polled a lab that was already up.
+    machines = _network_machines(item)
+    if machines:
+        return _aggregate_status([_system_status(m) for m in machines])
     # Fields live under three shapes: top-level, ``instance``, or ``system``.
     sources = [item, item.get("instance") or {}, item.get("system") or {}]
     for source in sources:
@@ -829,8 +873,11 @@ def cmd_lab_launch(api: HackSmarterAPI, config: Config, args) -> int:
             print_error("Lab has no systems/networks to launch.")
             return 1
         else:
-            print_error("Lab has multiple targets — specify one:")
-            _render_systems_table(_flatten_lab_items(systems))
+            print_error("Lab has multiple targets — specify one with --system:")
+            # Render the wrappers, not their machines: the IDs printed here
+            # have to be ones --system will accept, and an inner machine id
+            # is not addressable via /power.
+            _render_systems_table(systems, title="Targets")
             return 1
 
     # Kick a heartbeat before launching so the server treats us as an
@@ -860,12 +907,17 @@ def cmd_lab_launch(api: HackSmarterAPI, config: Config, args) -> int:
     console.print(f"[dim]Waiting for system to come up (timeout {args.timeout}s)…[/dim]")
 
     while time.monotonic() < deadline:
+        machines: List[Dict[str, Any]] = []
         try:
             payload = api.get_lab_systems(course_id, [system_id])
             items = _extract_items(payload)
             it = next((x for x in items if _item_id(x) == system_id), items[0] if items else None)
+            # A networks-lab target is a wrapper around several machines;
+            # flatten so the progress line and the final table talk about
+            # the machines the user actually connects to.
+            machines = _flatten_lab_items([it]) if it else []
             state = _system_status(it) if it else "unknown"
-            ip = _system_ip(it) if it else ""
+            ip = _system_ip(machines[0]) if len(machines) == 1 else ""
         except Exception as e:
             state = f"poll-error: {e}"; ip = ""
 
@@ -875,11 +927,19 @@ def cmd_lab_launch(api: HackSmarterAPI, config: Config, args) -> int:
             console.print(_badge(state, STATE_STYLE), end="")
             if ip:
                 console.print(f"  [cyan]{ip}[/cyan]", end="")
+            elif len(machines) > 1:
+                ready = sum(1 for m in machines
+                            if _system_status(m) in ("running", "ready", "active"))
+                console.print(f"  [dim]{ready}/{len(machines)} machines up[/dim]", end="")
             console.print()
             last_state = state
 
         if state in ("running", "ready", "active"):
-            console.print(f"[green]✓ system is up at {ip or '(no ip)'}.[/green]")
+            if len(machines) > 1:
+                console.print(f"[green]✓ all {len(machines)} systems are up.[/green]")
+                _render_systems_table(machines, title="Live status")
+            else:
+                console.print(f"[green]✓ system is up at {ip or '(no ip)'}.[/green]")
             return 0
         if state in ("error", "failed"):
             console.print(f"[red]✗ launch failed: {state}[/red]")

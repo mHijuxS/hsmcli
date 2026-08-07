@@ -15,6 +15,7 @@ from hsmcli.cli import (
     _system_ip,
     _system_status,
 )
+from hsmcli.resolvers import _item_id
 
 from conftest import CATALOG_BUNDLE, CATALOG_COURSE, ENROLLED
 
@@ -85,6 +86,35 @@ def test_flatten_expands_a_network_into_its_machines():
     assert all(m["_network"] == "Subnet" for m in out)
 
 
+# The live shape: machines sit flat on the wrapper, not under a "network"
+# key, and are keyed by systemId. Odyssey rendered as one "not_launched"
+# row until _flatten_lab_items learned this.
+NETWORK_PAYLOAD = [{
+    "id": "7de7b335",
+    "name": "Odyssey",
+    "systems": [
+        {"systemId": "s1", "name": "DC-01", "state": "running",
+         "ip": "10.1.77.132", "hostname": "DC-01"},
+        {"systemId": "s2", "name": "WKST-01", "state": "running",
+         "ip": "10.1.1.75", "hostname": "WKST-01"},
+        {"systemId": "s3", "name": "Web-01", "state": "running",
+         "ip": "10.1.151.67", "hostname": "Web-01"},
+    ],
+}]
+
+
+def test_flatten_expands_a_flat_network_wrapper():
+    out = _flatten_lab_items(NETWORK_PAYLOAD)
+    assert [m["name"] for m in out] == ["DC-01", "WKST-01", "Web-01"]
+    assert [_system_ip(m) for m in out] == ["10.1.77.132", "10.1.1.75", "10.1.151.67"]
+    assert all(m["_network"] == "Odyssey" for m in out)
+
+
+def test_flat_network_machines_keep_their_ids():
+    assert [_item_id(m) for m in _flatten_lab_items(NETWORK_PAYLOAD)] == \
+        ["s1", "s2", "s3"]
+
+
 def test_flatten_passes_systems_entries_through():
     payload = [{"id": "s1", "system": {"name": "Widget", "state": "running"}}]
     assert _flatten_lab_items(payload) == payload
@@ -104,6 +134,22 @@ def test_flatten_empty():
 ])
 def test_system_status_across_shapes(item, want):
     assert _system_status(item) == want
+
+
+@pytest.mark.parametrize("states,want", [
+    (["running", "running", "running"], "running"),
+    (["running", "starting", "running"], "starting"),
+    (["running", "stopped"], "stopped"),
+    (["running", "error"], "error"),
+    ([], "not_launched"),
+])
+def test_network_wrapper_status_folds_its_machines(states, want):
+    wrapper = {"id": "net", "name": "Odyssey",
+               "systems": [{"systemId": f"s{i}", "state": s}
+                           for i, s in enumerate(states)]}
+    # An empty systems[] is not a network wrapper — it falls through to
+    # the leaf path, which also answers "not_launched".
+    assert _system_status(wrapper) == want
 
 
 @pytest.mark.parametrize("item,want", [
