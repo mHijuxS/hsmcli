@@ -6,7 +6,7 @@ Commands:
     hsmcli config show
     hsmcli whoami
     hsmcli labs list [--search q] [--enrolled | --catalog]
-    hsmcli lab <id-or-name> info [--full] [--no-briefing]
+    hsmcli lab <id-or-name> info [--briefing] [--writeups] [--bundles] [--all]
     hsmcli lab <id-or-name> enroll
     hsmcli lab <id-or-name> systems
     hsmcli lab <id-or-name> launch [<system-id-or-name>] [--no-wait]
@@ -430,8 +430,77 @@ def _clean_markdown(md: str) -> str:
     return _HTML_DETAILS_RE.sub("", md or "").strip()
 
 
+# Headings whose section is a link dump to other people's solutions. `info`
+# hides those by default — a dozen walkthrough URLs are spoilers, and they
+# push the objective and the live systems off screen.
+_WRITEUP_HEADING_RE = re.compile(r"walkthrough|write[\s-]?up|solution", re.I)
+_FENCE_RE = re.compile(r"^\s*(```|~~~)")
+
+
+def _md_sections(md: str) -> List[Tuple[str, str]]:
+    """Split markdown into ``(heading_text, chunk)`` pairs on ATX headings.
+
+    Each chunk keeps its own heading line, so re-joining the chunks
+    reproduces the input; anything before the first heading comes back under
+    an empty heading. A ``#`` inside a fenced block is a shell comment, not a
+    heading — hence the fence tracking.
+    """
+    sections: List[Tuple[str, str]] = []
+    heading = ""
+    buf: List[str] = []
+    fence: Optional[str] = None
+    for line in (md or "").splitlines():
+        m = _FENCE_RE.match(line)
+        if m:
+            fence = None if fence else m.group(1)
+        elif fence is None and line.lstrip().startswith("#"):
+            if buf:
+                sections.append((heading, "\n".join(buf)))
+            heading = line.strip().lstrip("#").strip()
+            buf = [line]
+            continue
+        buf.append(line)
+    if buf:
+        sections.append((heading, "\n".join(buf)))
+    return sections
+
+
+def _drop_writeups(md: str) -> str:
+    """``md`` without its walkthrough/solution sections."""
+    return "\n".join(chunk for head, chunk in _md_sections(md)
+                     if not _WRITEUP_HEADING_RE.search(head)).strip()
+
+
+def _only_writeups(md: str) -> str:
+    """Just the walkthrough/solution sections of ``md`` (``""`` if none)."""
+    return "\n".join(chunk for head, chunk in _md_sections(md)
+                     if _WRITEUP_HEADING_RE.search(head)).strip()
+
+
+_OBJECTIVE_HEADING_RE = re.compile(r"objective|scope|goal", re.I)
+
+
+def _objective_scope(md: str) -> str:
+    """The brief: the Objective/Scope section and everything after it.
+
+    Lab descriptions open with boilerplate — author credit, "Free Lab", a
+    Discord invite, a call for pentest reports — and only then get to the
+    point. What follows the objective is the part you act on (Initial
+    Access, Starting Credentials), so this keeps the tail rather than the
+    one section. Labs that don't use an Objective heading fall back to the
+    whole description.
+    """
+    sections = _md_sections(md)
+    for i, (head, _) in enumerate(sections):
+        if _OBJECTIVE_HEADING_RE.search(head):
+            return "\n".join(chunk for h, chunk in sections[i:]
+                             if not _WRITEUP_HEADING_RE.search(h)).strip()
+    return _drop_writeups(md)
+
+
 def _lesson_renderables(items: List[Dict[str, Any]],
-                        lab_names: Dict[str, str]) -> List[Any]:
+                        lab_names: Dict[str, str],
+                        strip_writeups: bool = True) -> List[Any]:
     """Turn a lesson's ``content.items[]`` into printable rich renderables.
 
     Item types seen in the wild: ``text`` (markdown briefing), ``video``,
@@ -444,6 +513,8 @@ def _lesson_renderables(items: List[Dict[str, Any]],
         itype = str(it.get("type") or "")
         if itype == "text":
             md = _clean_markdown(it.get("markdown") or it.get("content") or "")
+            if strip_writeups:
+                md = _drop_writeups(md)
             if md:
                 # hyperlinks=False prints "text (url)" instead of an OSC-8
                 # escape — walkthrough//video URLs are worth copying, and
@@ -485,22 +556,16 @@ def _lab_reference_names(take: Any) -> Dict[str, str]:
     return names
 
 
-def _render_briefing(api: HackSmarterAPI, course_id: str, full: bool) -> Optional[str]:
+def _render_briefing(api: HackSmarterAPI, take: Any, full: bool) -> None:
     """Render the lesson content (markdown briefing, video, questions).
 
     Lives only in /take — ``GET /courses/{id}`` returns lesson stubs — so
-    this needs enrollment; a 403 here is informational, not fatal. Returns
-    the error message when /take was unreachable (the caller skips the
-    system-status lookup then — it reads the same endpoint), else None.
+    this needs enrollment; the caller fetches the payload and decides what a
+    failure means.
     """
-    try:
-        take = api.get_course_take(course_id, use_cache=True)
-    except Exception as e:
-        return str(e)
-
     lessons = [l for l in api.extract_lessons(take) if l["items"]]
     if not lessons:
-        return None
+        return
 
     lab_names = _lab_reference_names(take)
     shown = lessons if full else lessons[:BRIEFING_LESSON_LIMIT]
@@ -520,7 +585,30 @@ def _render_briefing(api: HackSmarterAPI, course_id: str, full: bool) -> Optiona
     hidden = len(lessons) - len(shown)
     if hidden > 0:
         print_info(f"{hidden} more lesson(s) with content — pass --full to render them")
-    return None
+
+
+def _render_writeups(api: HackSmarterAPI, take: Any, body: Dict[str, Any]) -> None:
+    """The community-walkthrough links, pulled back out of the markdown.
+
+    They show up in the lesson text and (sometimes) in the course
+    description, so both are scanned and identical chunks collapsed.
+    """
+    seen: List[str] = []
+    sources = [body.get("description_markdown") or ""]
+    for les in api.extract_lessons(take):
+        for it in les["items"]:
+            if str(it.get("type") or "") == "text":
+                sources.append(it.get("markdown") or it.get("content") or "")
+    for md in sources:
+        chunk = _only_writeups(_clean_markdown(md))
+        if chunk and chunk not in seen:
+            seen.append(chunk)
+    if not seen:
+        print_info("No community walkthroughs listed for this lab.")
+        return
+    console.print(Panel(Markdown("\n\n".join(seen), hyperlinks=False),
+                        title="Community walkthroughs",
+                        border_style="dim", padding=(0, 2)))
 
 
 def cmd_lab_info(api: HackSmarterAPI, config: Config, args) -> int:
@@ -535,6 +623,15 @@ def cmd_lab_info(api: HackSmarterAPI, config: Config, args) -> int:
     body = _unwrap_course(data)
     if not body:
         print_json(data); return 0
+
+    # Default view is what you need while working the box: what it is, what
+    # you're meant to do, which flags are outstanding, which machines are up.
+    # Everything else is opt-in.
+    show_all = getattr(args, "all_sections", False)
+    want_briefing = show_all or args.briefing or args.full
+    want_chapters = show_all or args.chapters
+    want_writeups = show_all or args.writeups
+    want_bundles = show_all or args.bundles
 
     name = body.get("name") or body.get("title") or "?"
     cid = body.get("id") or course_id
@@ -562,28 +659,32 @@ def cmd_lab_info(api: HackSmarterAPI, config: Config, args) -> int:
 
     lines = [header, "\n", meta]
     image_path = body.get("image_path")
-    if image_path:
+    if image_path and show_all:
         lines += ["\n", Text(f"image: {api.image_url(image_path)}", style="dim")]
 
     console.print()
     console.print(Panel(Text.assemble(*lines),
                         border_style="cyan", padding=(0, 2)))
 
-    # Description — description_markdown carries the real briefing
-    # (objective/scope, author, initial access); the plain `description`
-    # field is just a one-line blurb. Prefer the markdown one when present.
-    desc_md = body.get("description_markdown") or ""
+    # Objective / scope — description_markdown carries the real brief; the
+    # plain `description` field is just a one-line blurb. --all prints the
+    # description whole (credits, Discord invite, submission links);
+    # --writeups prints the walkthrough links on their own at the end.
+    full_desc = _clean_markdown(body.get("description_markdown") or "")
+    desc_md = _drop_writeups(full_desc) if show_all else _objective_scope(full_desc)
     desc_plain = body.get("description") or ""
     if desc_md:
-        console.print(Panel(Markdown(desc_md.strip()), title="Description",
+        console.print(Panel(Markdown(desc_md, hyperlinks=False),
+                            title="Objective / scope",
                             border_style="dim", padding=(0, 2)))
     elif desc_plain:
-        console.print(Panel(desc_plain.strip(), title="Description",
+        console.print(Panel(desc_plain.strip(), title="Objective / scope",
                             border_style="dim", padding=(0, 2)))
 
-    # Chapters / lessons — most useful bit for a lab writeup
+    # Chapters / lessons — off by default: a challenge lab is one chapter
+    # with one lesson, so the table says nothing you can act on.
     chapters = body.get("chapters") or []
-    if chapters:
+    if chapters and want_chapters:
         t = Table(title="Chapters", show_header=True,
                   header_style="bold", border_style="dim")
         t.add_column("#", justify="right", style="dim")
@@ -598,20 +699,28 @@ def cmd_lab_info(api: HackSmarterAPI, config: Config, args) -> int:
                       f"{done}/{len(lessons)}")
         console.print(t)
 
-    # Lesson content — the actual briefing (walkthrough links, hints,
-    # starting credentials, questions). Only /take carries it.
+    # Everything below rides on /take: the flags, the lesson content and the
+    # ids the live-status lookup needs. One fetch, one failure message.
+    take: Any = None
     take_error: Optional[str] = None
-    if not getattr(args, "no_briefing", False):
-        take_error = _render_briefing(api, course_id,
-                                      full=getattr(args, "full", False))
+    try:
+        take = api.get_course_take(course_id, use_cache=True)
+    except Exception as e:
+        take_error = str(e)
 
-    # Live systems / network status — get_lab_systems auto-detects the
-    # lab kind (systems vs networks) and picks the right endpoint / ids.
-    # It reads /take too, so a failure above means this can only repeat it.
     if take_error:
-        console.print(f"[dim]lesson content + system status unavailable: "
-                      f"{take_error}[/dim]")
+        console.print(f"[dim]flags, lesson content and system status "
+                      f"unavailable: {take_error}[/dim]")
     else:
+        if want_briefing:
+            _render_briefing(api, take, full=getattr(args, "full", False))
+
+        questions = api.extract_questions(take)
+        if questions:
+            _render_flags_table(questions, title="Flags")
+
+        # Live systems / network status — get_lab_systems auto-detects the
+        # lab kind (systems vs networks) and picks the right endpoint / ids.
         try:
             if api.lab_kind(course_id) == "aws":
                 aws_labs = api.get_aws_labs(course_id)
@@ -628,16 +737,21 @@ def cmd_lab_info(api: HackSmarterAPI, config: Config, args) -> int:
         except Exception as e:
             console.print(f"[dim]systems status unavailable: {e}[/dim]")
 
-    # Pricing hint (compact)
-    prices = body.get("bundle_pricing") or []
-    if prices:
-        console.print(Panel(
-            "\n".join(f"• {p.get('course_bundle_title','?')} — "
-                      f"${(p.get('monthly_price_cents') or 0)/100:.2f}/mo"
-                      for p in prices[:5]),
-            title="Bundles",
-            border_style="dim", padding=(0, 2),
-        ))
+        if want_writeups:
+            _render_writeups(api, take, body)
+
+    if want_bundles:
+        prices = body.get("bundle_pricing") or []
+        if prices:
+            console.print(Panel(
+                "\n".join(f"• {p.get('course_bundle_title','?')} — "
+                          f"${(p.get('monthly_price_cents') or 0)/100:.2f}/mo"
+                          for p in prices[:5]),
+                title="Bundles",
+                border_style="dim", padding=(0, 2),
+            ))
+        else:
+            print_info("No bundle pricing listed for this lab.")
     return 0
 
 
@@ -849,6 +963,18 @@ def cmd_lab_status(api: HackSmarterAPI, config: Config, args) -> int:
     return 0
 
 
+RUNNING_STATES = ("running", "ready", "active")
+BOOTING_STATES = ("provisioning", "starting", "pending")
+
+
+def _lookup_target(api: HackSmarterAPI, course_id: str,
+                   system_id: str) -> Optional[Dict[str, Any]]:
+    """The live wrapper for one system/network id (None if the lab has none)."""
+    items = _extract_items(api.get_lab_systems(course_id, [system_id]))
+    return next((x for x in items if _item_id(x) == system_id),
+                items[0] if items else None)
+
+
 def cmd_lab_launch(api: HackSmarterAPI, config: Config, args) -> int:
     import time
     fmt = _format_choice(args, config)
@@ -859,6 +985,7 @@ def cmd_lab_launch(api: HackSmarterAPI, config: Config, args) -> int:
     if api.lab_kind(course_id) == "aws":
         return _cmd_lab_launch_aws(api, config, args, course_id)
 
+    current: Optional[Dict[str, Any]] = None   # live wrapper, when we have it
     if args.system:
         system_id = resolve_system_id(api, course_id, args.system)
     else:
@@ -867,8 +994,9 @@ def cmd_lab_launch(api: HackSmarterAPI, config: Config, args) -> int:
         # Do NOT flatten first; the inner machine ids won't work.
         systems = _extract_items(api.get_lab_systems(course_id))
         if len(systems) == 1:
-            system_id = _item_id(systems[0]) or ""
-            print_info(f"Auto-selected: {_course_label(systems[0])}")
+            current = systems[0]
+            system_id = _item_id(current) or ""
+            print_info(f"Auto-selected: {_course_label(current)}")
         elif not systems:
             print_error("Lab has no systems/networks to launch.")
             return 1
@@ -880,19 +1008,44 @@ def cmd_lab_launch(api: HackSmarterAPI, config: Config, args) -> int:
             _render_systems_table(systems, title="Targets")
             return 1
 
-    # Kick a heartbeat before launching so the server treats us as an
-    # "active" viewer (the browser does the same on the /take page).
-    try:
-        api.heartbeat_for_course(course_id)
-    except Exception:
-        pass  # non-fatal — launch will still be attempted
+    # Read the live state before powering anything on. The server answers a
+    # power-on for a machine that's already up with "System is already
+    # running", and rejects one for a machine still provisioning with a 400
+    # — both of which read as a failed launch from the outside.
+    if current is None:
+        try:
+            current = _lookup_target(api, course_id, system_id)
+        except Exception:
+            current = None  # unreadable — launch anyway, that reports why
+    state = _system_status(current) if current else ""
+    machines = _flatten_lab_items([current]) if current else []
 
-    data = api.launch_system(course_id, system_id)
-    if fmt in ("json", "yaml"):
-        print_output(data, fmt); return 0
-    print_success(f"Launched system {system_id}")
-    if isinstance(data, dict) and data and not args.wait:
-        print_json(data)
+    if state in RUNNING_STATES:
+        if fmt in ("json", "yaml"):
+            print_output(current, fmt); return 0
+        print_info("Already running — nothing to launch.")
+        _render_systems_table(machines, title="Live status")
+        return 0
+
+    booting = state in BOOTING_STATES
+    if booting:
+        if fmt in ("json", "yaml") and not args.wait:
+            print_output(current, fmt); return 0
+        print_info(f"Already {state} — skipping the power call.")
+    else:
+        # Kick a heartbeat before launching so the server treats us as an
+        # "active" viewer (the browser does the same on the /take page).
+        try:
+            api.heartbeat_for_course(course_id)
+        except Exception:
+            pass  # non-fatal — launch will still be attempted
+
+        data = api.launch_system(course_id, system_id)
+        if fmt in ("json", "yaml"):
+            print_output(data, fmt); return 0
+        print_success(f"Launched system {system_id}")
+        if isinstance(data, dict) and data and not args.wait:
+            print_json(data)
 
     if not args.wait:
         print_info(f"Provisioning takes 2–5 min. Poll with "
@@ -907,14 +1060,12 @@ def cmd_lab_launch(api: HackSmarterAPI, config: Config, args) -> int:
     console.print(f"[dim]Waiting for system to come up (timeout {args.timeout}s)…[/dim]")
 
     while time.monotonic() < deadline:
+        # A networks-lab target is a wrapper around several machines;
+        # flatten so the progress line and the final table talk about the
+        # machines the user actually connects to.
         machines: List[Dict[str, Any]] = []
         try:
-            payload = api.get_lab_systems(course_id, [system_id])
-            items = _extract_items(payload)
-            it = next((x for x in items if _item_id(x) == system_id), items[0] if items else None)
-            # A networks-lab target is a wrapper around several machines;
-            # flatten so the progress line and the final table talk about
-            # the machines the user actually connects to.
+            it = _lookup_target(api, course_id, system_id)
             machines = _flatten_lab_items([it]) if it else []
             state = _system_status(it) if it else "unknown"
             ip = _system_ip(machines[0]) if len(machines) == 1 else ""
@@ -929,12 +1080,12 @@ def cmd_lab_launch(api: HackSmarterAPI, config: Config, args) -> int:
                 console.print(f"  [cyan]{ip}[/cyan]", end="")
             elif len(machines) > 1:
                 ready = sum(1 for m in machines
-                            if _system_status(m) in ("running", "ready", "active"))
+                            if _system_status(m) in RUNNING_STATES)
                 console.print(f"  [dim]{ready}/{len(machines)} machines up[/dim]", end="")
             console.print()
             last_state = state
 
-        if state in ("running", "ready", "active"):
+        if state in RUNNING_STATES:
             if len(machines) > 1:
                 console.print(f"[green]✓ all {len(machines)} systems are up.[/green]")
                 _render_systems_table(machines, title="Live status")
@@ -1650,12 +1801,20 @@ def build_parser() -> argparse.ArgumentParser:
     lsub2 = pl.add_subparsers(dest="subcommand", required=True,
                               metavar="ACTION")
     _lif = lsub2.add_parser(
-        "info", help="show lab metadata, briefing and live system status")
+        "info", help="lab card: objective/scope, flags and live system status")
+    _lif.add_argument("--briefing", action="store_true",
+                      help="also render the lesson content (notes, videos)")
     _lif.add_argument("--full", action="store_true",
-                      help=f"render every lesson's content "
-                           f"(default: first {BRIEFING_LESSON_LIMIT})")
-    _lif.add_argument("--no-briefing", action="store_true",
-                      help="skip lesson content (metadata only)")
+                      help=f"render every lesson's content (implies "
+                           f"--briefing; default: first {BRIEFING_LESSON_LIMIT})")
+    _lif.add_argument("--chapters", action="store_true",
+                      help="also show the chapter/lesson table")
+    _lif.add_argument("--writeups", action="store_true",
+                      help="also list the community walkthrough links")
+    _lif.add_argument("--bundles", action="store_true",
+                      help="also show the subscription bundles this lab is in")
+    _lif.add_argument("--all", dest="all_sections", action="store_true",
+                      help="show every optional section")
     _add_format_flags(_lif)
 
     for name, help_text in [

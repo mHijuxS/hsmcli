@@ -4,6 +4,10 @@ import pytest
 
 from hsmcli.cli import (
     _aws_env_exports,
+    _drop_writeups,
+    _md_sections,
+    _objective_scope,
+    _only_writeups,
     _extract_difficulty,
     _extract_state,
     _flatten_lab_items,
@@ -295,3 +299,98 @@ def test_verdict_unknown_reply_is_none_not_false(payload):
     """An unparsed reply must never render as a wrong flag."""
     correct, _ = _submission_verdict(payload)
     assert correct is None
+
+
+# ── markdown sections (what `lab info` keeps and drops) ───────────────────
+
+LAB_MD = """### Author
+- [Someone](https://example.com)
+
+### Community Walkthroughs
+- [Widget](https://example.com/a) - a
+- [Widget](https://example.com/b) - b
+
+# Objective / Scope
+Pop the box.
+
+#### Starting Credentials
+```
+user:pass
+```"""
+
+
+def test_drop_writeups_keeps_the_brief():
+    kept = _drop_writeups(LAB_MD)
+    assert "Objective / Scope" in kept
+    assert "Starting Credentials" in kept
+    assert "user:pass" in kept
+    assert "Author" in kept
+
+
+def test_drop_writeups_removes_the_walkthrough_links():
+    kept = _drop_writeups(LAB_MD)
+    assert "Community Walkthroughs" not in kept
+    assert "example.com/a" not in kept
+
+
+def test_only_writeups_is_the_complement():
+    only = _only_writeups(LAB_MD)
+    assert "Community Walkthroughs" in only
+    assert "example.com/b" in only
+    assert "Objective" not in only
+
+
+def test_only_writeups_empty_when_lab_has_none():
+    assert _only_writeups("# Objective\nPop it.") == ""
+
+
+def test_md_sections_ignores_hashes_inside_code_fences():
+    """A `#` opening a shell comment is not a heading — splitting on it
+    would tear a fenced block in half and mangle the render."""
+    md = "# Objective\nrun this:\n```\n# comment\nid\n```\n"
+    heads = [h for h, _ in _md_sections(md)]
+    assert heads == ["Objective"]
+    assert _drop_writeups(md).count("```") == 2
+
+
+def test_md_sections_keeps_a_preamble_under_an_empty_heading():
+    sections = _md_sections("intro text\n# Objective\nbody")
+    assert sections[0][0] == ""
+    assert "intro text" in sections[0][1]
+
+
+# ── objective / scope extraction ──────────────────────────────────────────
+
+def test_objective_scope_drops_the_preamble_and_keeps_the_tail():
+    """Descriptions open with credits/promo and only then get to the point;
+    what follows the objective (Initial Access, Starting Credentials) is the
+    part you act on."""
+    kept = _objective_scope(LAB_MD)
+    assert kept.startswith("# Objective / Scope")
+    assert "Starting Credentials" in kept
+    assert "Author" not in kept
+
+
+def test_objective_scope_matches_a_bare_objective_heading():
+    md = "### Author\n- me\n\n### Objective\nPop it.\n\n### Initial Access\nVPN only."
+    kept = _objective_scope(md)
+    assert "Pop it." in kept and "Initial Access" in kept
+    assert "### Author" not in kept
+
+
+def test_objective_scope_drops_promo_sections_before_the_objective():
+    md = ("### Free Lab\nfree!\n\n### Join the Discord\ncome chat\n\n"
+          "# Objective / Scope\nthe brief")
+    kept = _objective_scope(md)
+    assert kept == "# Objective / Scope\nthe brief"
+
+
+def test_objective_scope_falls_back_to_the_whole_description():
+    """No Objective heading — better a full description than a blank panel."""
+    md = "### Author\n- me\n\n### Notes\nsomething"
+    assert _objective_scope(md) == md
+
+
+def test_objective_scope_still_drops_walkthroughs_after_the_objective():
+    md = "# Objective\nthe brief\n\n### Community Walkthroughs\n- [x](http://x)"
+    assert "Walkthroughs" not in _objective_scope(md)

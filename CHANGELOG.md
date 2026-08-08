@@ -4,6 +4,34 @@ All notable changes to this project. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 [semver](https://semver.org/), pre-1.0 (minor bumps may break behaviour).
 
+## [Unreleased]
+
+### Changed
+
+- **`lab info` is now a working view, not a dump.** It prints the header,
+  the objective/scope, the flags and the live systems — the four things you
+  need while on the box. The chapter table, lesson briefing, community
+  walkthrough links (spoilers) and bundle pricing moved behind `--chapters`,
+  `--briefing`, `--writeups` and `--bundles`; `--all` shows everything.
+  `--full` still renders every lesson and now implies `--briefing`.
+  `--no-briefing` is gone — that's the default.
+- Walkthrough sections are stripped from the briefing too, so `--briefing`
+  no longer smuggles the link dump back in.
+
+### Fixed
+
+- **`launch` failed on a lab that was already up or still booting.** It
+  powered on unconditionally; the server answers that with "System is
+  already running", or a 400 while the instance is still provisioning, so a
+  successful launch reported `✗ 400 Client Error` and exited non-zero.
+  `launch` now reads the live state first — already running prints the
+  status and exits 0, already booting skips straight to the poll — and a
+  power call rejected right after `/launch` was accepted is treated as
+  provisioning rather than failure.
+- Power/launch/reset calls now raise the same typed errors as every other
+  request, so a rejection shows the server's reason instead of just
+  `400 Client Error: Bad Request for url: …`.
+
 ## [0.2.0] — 2026-08-05
 
 ### Fixed

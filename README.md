@@ -62,9 +62,12 @@ hsmcli labs list -s "active directory"  # substring filter on name/description
 hsmcli labs list --sort difficulty      # sort by name | difficulty | state
 
 # One lab — identifier comes first, then the action
-hsmcli lab <name> info                  # rich card + chapters + lesson briefing + live systems
-hsmcli lab <name> info --full           # render every lesson's content (default: first 3)
-hsmcli lab <name> info --no-briefing    # metadata only, skip lesson content
+hsmcli lab <name> info                  # objective/scope + flags + live systems
+hsmcli lab <name> info --briefing       # + lesson content (--full for every lesson, default: first 3)
+hsmcli lab <name> info --chapters       # + the chapter/lesson table
+hsmcli lab <name> info --writeups       # + community walkthrough links (hidden by default: spoilers)
+hsmcli lab <name> info --bundles        # + the subscription bundles this lab is in
+hsmcli lab <name> info --all            # every optional section
 hsmcli lab <name> take                  # raw /take payload
 hsmcli lab <name> enroll                # POST /enroll
 hsmcli lab <name> systems               # live status of all systems
@@ -154,7 +157,7 @@ The two endpoints also disagree on state vocabulary — `/courses` says
 | `labs list` | GET | `/api/student/courses` + `/api/student/catalog` (merged) | — |
 | `labs list -e` | GET | `/api/student/courses` | — |
 | `labs list --catalog` | GET | `/api/student/catalog` | — |
-| `lab info` | GET | `/api/student/courses/{id}` + `/take` (briefing) | — |
+| `lab info` | GET | `/api/student/courses/{id}` + `/take` (flags, briefing) | — |
 | `lab take` | GET | `/api/student/courses/{id}/take` | — |
 | `lab enroll` | POST | `/api/student/courses/{id}/enroll` | — |
 | `lab systems` / `status` | GET | `/api/student/courses/{playthrough}/systems?courseSystemIds=[…]` | — |

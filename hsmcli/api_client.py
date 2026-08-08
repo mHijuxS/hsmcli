@@ -291,29 +291,40 @@ class HackSmarterAPI:
             self._trace(method_up, endpoint, r, payload=out)
             return out
         except requests.exceptions.HTTPError as e:
-            code = e.response.status_code if e.response is not None else "?"
-            body = e.response.text[:400] if e.response is not None else ""
-            if code == 401:
-                raise AuthError(
-                    "Authentication failed (401). Cookie may be expired. "
-                    "Update it with: hsmcli config set-cookie '<paste cookie header>' "
-                    "or export HSMCLI_COOKIE."
-                )
-            if code == 403:
-                # The API returns a bare {"error":"forbidden"} for both
-                # "not enrolled yet" and genuine permission issues — the
-                # former is by far the common case (owned/free labs still
-                # need an explicit /enroll before /take or system-status
-                # endpoints serve data), so point at it directly.
-                m = re.search(r"/courses/([0-9a-fA-F-]{36})", endpoint)
-                hint = f" Not enrolled? Try: hsmcli lab {m.group(1)} enroll" if m else ""
-                raise ForbiddenError(
-                    f"HTTP 403 (forbidden) on {method_up} {endpoint}: {body}.{hint}")
-            raise APIError(f"HTTP {code} on {method_up} {endpoint}: {body}",
-                           status=code if isinstance(code, int) else None,
-                           endpoint=endpoint, body=body)
+            self._raise_http_error(e, method_up, endpoint)
         except requests.exceptions.RequestException as e:
             raise TransportError(f"Request failed: {e}")
+
+    def _raise_http_error(self, e: "requests.exceptions.HTTPError",
+                          method_up: str, endpoint: str) -> None:
+        """Translate an HTTPError into a typed error carrying the body.
+
+        Shared with ``_power_call``, which used to let requests' own
+        exception through — so a rejected launch reported only
+        "400 Client Error: Bad Request for url: …" and dropped the one part
+        that says *why* ("System is already running", and friends).
+        """
+        code = e.response.status_code if e.response is not None else "?"
+        body = e.response.text[:400] if e.response is not None else ""
+        if code == 401:
+            raise AuthError(
+                "Authentication failed (401). Cookie may be expired. "
+                "Update it with: hsmcli config set-cookie '<paste cookie header>' "
+                "or export HSMCLI_COOKIE."
+            )
+        if code == 403:
+            # The API returns a bare {"error":"forbidden"} for both
+            # "not enrolled yet" and genuine permission issues — the
+            # former is by far the common case (owned/free labs still
+            # need an explicit /enroll before /take or system-status
+            # endpoints serve data), so point at it directly.
+            m = re.search(r"/courses/([0-9a-fA-F-]{36})", endpoint)
+            hint = f" Not enrolled? Try: hsmcli lab {m.group(1)} enroll" if m else ""
+            raise ForbiddenError(
+                f"HTTP 403 (forbidden) on {method_up} {endpoint}: {body}.{hint}")
+        raise APIError(f"HTTP {code} on {method_up} {endpoint}: {body}",
+                       status=code if isinstance(code, int) else None,
+                       endpoint=endpoint, body=body)
 
     # ── session ───────────────────────────────────────────────────────────
     def session_summary(self) -> Optional[Dict[str, Any]]:
@@ -522,14 +533,26 @@ class HackSmarterAPI:
 
         # Provision step exists only for systems-labs; networks-labs go
         # straight to /power.
+        provisioned = False
         if resource == "systems":
             try:
                 self._power_call("POST", base + "/launch", None, take_referer)
+                provisioned = True
             except Exception:
-                pass
-        return self._power_call(
-            "POST", base + "/power", {"power": "on"}, take_referer,
-        )
+                pass  # already provisioned, or the lab doesn't need this step
+        try:
+            return self._power_call(
+                "POST", base + "/power", {"power": "on"}, take_referer,
+            )
+        except APIError as e:
+            # A system that just accepted /launch is already coming up, and
+            # the server rejects /power until the instance exists. That's a
+            # race, not a failed launch — say so and let the caller poll,
+            # instead of exiting non-zero on a machine that is booting.
+            if provisioned and isinstance(e.status, int) and 400 <= e.status < 500:
+                return {"success": True, "provisioning": True,
+                        "message": f"provisioning; power-on deferred ({e})"}
+            raise
 
     def power_off_system(self, course_id: str, system_id: str) -> Dict[str, Any]:
         pt = self._ensure_playthrough(course_id)
@@ -564,11 +587,16 @@ class HackSmarterAPI:
     ) -> Dict[str, Any]:
         url = urljoin(self.base_url + "/", path.lstrip("/"))
         headers = {"Referer": referer}
-        if body is None:
-            r = self.session.request(method, url, data=b"", headers=headers)
-        else:
-            r = self.session.request(method, url, json=body, headers=headers)
-        r.raise_for_status()
+        try:
+            if body is None:
+                r = self.session.request(method, url, data=b"", headers=headers)
+            else:
+                r = self.session.request(method, url, json=body, headers=headers)
+            r.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            self._raise_http_error(e, method.upper(), path)
+        except requests.exceptions.RequestException as e:
+            raise TransportError(f"Request failed: {e}")
         # Power/submit calls bypass _request (they need a per-call Referer),
         # so trace them here too or --debug would miss every lifecycle op.
         if not r.content:
