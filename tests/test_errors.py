@@ -1,5 +1,7 @@
 """Typed exceptions, IP validation, and incomplete-command exit codes."""
 
+import argparse
+
 import pytest
 import requests
 
@@ -8,12 +10,13 @@ from hsmcli.api_client import (
     AuthError,
     ForbiddenError,
     HsmcliError,
+    HttpError,
     NotEnrolledError,
     TransportError,
     HackSmarterAPI,
     detect_public_ip,
 )
-from hsmcli.cli import _need_subcommand
+from hsmcli.cli import _explain_error, _need_subcommand
 from hsmcli.config import Config
 
 
@@ -89,6 +92,114 @@ def test_missing_playthrough_raises_notenrollederror(api, monkeypatch):
     monkeypatch.setattr(api, "get_course_take", lambda *a, **k: {"course": {}})
     with pytest.raises(NotEnrolledError, match="enroll first"):
         api._aws_lab_base("some-course")
+
+
+def test_every_http_error_carries_the_response(api, monkeypatch):
+    """The CLI writes the human-readable version from these fields, so 401
+    and 403 have to carry them too — not just APIError."""
+    monkeypatch.setattr(api.session, "get",
+                        lambda *a, **k: ErrorResponse(403, '{"error":"forbidden"}'))
+    with pytest.raises(ForbiddenError) as e:
+        api._request("GET", "/api/student/courses/x/take")
+    assert e.value.status == 403
+    assert e.value.endpoint == "/api/student/courses/x/take"
+    assert "forbidden" in e.value.body
+
+
+# ── server_message: the part worth repeating ──────────────────────────────
+
+@pytest.mark.parametrize("body,want", [
+    ('{"message":"System is already running"}', "System is already running"),
+    ('{"error":"forbidden","message":"Forbidden"}', ""),   # echoes the status
+    ('{"error":"not_found"}', ""),
+    ("", ""),
+    ("<html><body>502 Bad Gateway</body></html>", ""),
+    ("not json at all", "not json at all"),
+])
+def test_server_message_keeps_sentences_and_drops_status_echoes(body, want):
+    """`{"message":"Forbidden"}` restates the status code. Printing it as the
+    reason is how the old output ended up saying 'forbidden: Forbidden'."""
+    assert HttpError("technical", body=body).server_message() == want
+
+
+def test_server_message_ignores_a_long_non_json_body():
+    assert HttpError("x", body="y" * 500).server_message() == ""
+
+
+# ── errors, as a person reads them ────────────────────────────────────────
+
+def _args(**kw):
+    d = {"identifier": "dark", "debug": False}
+    d.update(kw)
+    return argparse.Namespace(**d)
+
+
+def test_403_is_explained_as_not_enrolled_with_the_typed_name(capsys):
+    """The transcript that started this: a raw 'HTTP 403 (forbidden) on GET
+    /api/student/courses/<uuid>/take: {...}' with the fix buried at the end
+    of the line, quoting a UUID the user never typed."""
+    rc = _explain_error(
+        ForbiddenError("HTTP 403 …", status=403,
+                       endpoint="/api/student/courses/abc/take",
+                       body='{"error":"forbidden","message":"Forbidden"}'),
+        _args())
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "not enrolled" in err.lower()
+    assert "hsmcli lab dark enroll" in err
+    # None of the plumbing survives into the message.
+    assert "HTTP 403" not in err
+    assert "/api/student" not in err
+
+
+def test_401_explains_how_to_sign_in_again(capsys):
+    rc = _explain_error(AuthError("HTTP 401 …", status=401), _args())
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "set-cookie" in err
+
+
+def test_a_rejected_request_reports_the_server_reason(capsys):
+    rc = _explain_error(
+        APIError("HTTP 400 …", status=400, endpoint="/power",
+                 body='{"message":"System is already running"}'), _args())
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "System is already running" in err
+
+
+def test_a_server_outage_is_not_reported_as_your_mistake(capsys):
+    rc = _explain_error(APIError("HTTP 503 …", status=503), _args())
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "503" in err
+    assert "their side" in err
+
+
+def test_offline_says_so(capsys):
+    rc = _explain_error(TransportError("Request failed: timeout"), _args())
+    assert rc == 1
+    assert "reach hacksmarter.org" in capsys.readouterr().err
+
+
+def test_explanations_never_land_on_stdout(capsys):
+    """`hsmcli lab x info --json > out.json` must not get an error message
+    mixed into the JSON."""
+    _explain_error(ForbiddenError("x", status=403), _args())
+    assert capsys.readouterr().out == ""
+
+
+def test_an_unknown_exception_still_says_something_and_offers_debug(capsys):
+    rc = _explain_error(RuntimeError("something odd"), _args())
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "something odd" in err
+    assert "--debug" in err
+
+
+def test_debug_users_are_not_told_to_pass_debug(capsys):
+    _explain_error(RuntimeError("boom"), _args(debug=True))
+    assert "--debug" not in capsys.readouterr().err
 
 
 # ── detect_public_ip validation ───────────────────────────────────────────

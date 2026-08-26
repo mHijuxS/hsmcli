@@ -228,6 +228,21 @@ def resolve_course_id(api, identifier: str) -> str:
     return cid
 
 
+def resolve_course(api, identifier: str) -> Tuple[str, str]:
+    """``(course_id, lab name)`` — the name is ``""`` for a bare UUID.
+
+    Same resolution as :func:`resolve_course_id`, but it hands back the
+    matched item's name so a command can say "Launching Dark" instead of
+    "Launching d500ab4b-f68b-4ac8-ace3-ef7a1307d9c2". A UUID resolves
+    without a listing call, so there's no name to hand back; callers that
+    want one fall back to ``api.course_name()``.
+    """
+    if is_uuid(identifier):
+        return identifier, ""
+    cid, item = resolve_from_list(identifier, all_lab_items(api))
+    return cid, _item_name(item or {})
+
+
 def resolve_system_id(api, course_id: str, identifier: str) -> str:
     if is_uuid(identifier):
         return identifier

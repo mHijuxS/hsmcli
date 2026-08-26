@@ -5,6 +5,7 @@ from .api_client import (
     AuthError,
     ForbiddenError,
     HsmcliError,
+    HttpError,
     NotEnrolledError,
     TransportError,
     client_version,
@@ -21,6 +22,7 @@ __all__ = [
     "__version__",
     # Catch these when using hsmcli as a library; all subclass HsmcliError.
     "HsmcliError",
+    "HttpError",
     "AuthError",
     "ForbiddenError",
     "NotEnrolledError",

@@ -30,20 +30,15 @@ class HsmcliError(Exception):
     """Base class for every error this client raises."""
 
 
-class AuthError(HsmcliError):
-    """401 — the session cookie is missing, expired, or rejected."""
+class HttpError(HsmcliError):
+    """A failed HTTP call, with the response kept for the caller.
 
-
-class ForbiddenError(HsmcliError):
-    """403 — usually "not enrolled yet" rather than a real permission issue."""
-
-
-class NotEnrolledError(HsmcliError):
-    """No playthrough for this course yet, so lifecycle ids don't exist."""
-
-
-class APIError(HsmcliError):
-    """A non-2xx response that isn't 401/403."""
+    ``str(e)`` stays technical — endpoint, status, response body — because
+    that's what belongs in a ``--debug`` trace or a bug report. The CLI
+    doesn't print it verbatim: it reads ``status``/``endpoint``/``body``
+    off the exception and writes the plain-language version (see
+    ``cli._explain_error``).
+    """
 
     def __init__(self, message: str, status: Optional[int] = None,
                  endpoint: Optional[str] = None, body: str = ""):
@@ -51,6 +46,61 @@ class APIError(HsmcliError):
         self.status = status
         self.endpoint = endpoint
         self.body = body
+
+    def server_message(self) -> str:
+        """The API's own explanation, when it gave one worth repeating.
+
+        HackSmarter answers most failures with ``{"error": "forbidden",
+        "message": "Forbidden"}`` — an echo of the status code that tells
+        the reader nothing. Those are dropped; a real sentence ("System is
+        already running") is kept.
+        """
+        text = (self.body or "").strip()
+        if not text:
+            return ""
+        try:
+            payload = json.loads(text)
+        except ValueError:
+            # Not JSON — an HTML error page or a proxy banner. Only worth
+            # repeating if it's short enough to be a sentence.
+            if text.startswith("<") or len(text) > 200:
+                return ""
+            return text
+        if not isinstance(payload, dict):
+            return ""
+        for key in ("message", "error", "detail"):
+            v = payload.get(key)
+            if not isinstance(v, str) or not v.strip():
+                continue
+            v = v.strip()
+            # Drop restatements of the status line ("Forbidden", "forbidden",
+            # "Bad Request") — they read as detail without being any.
+            if v.lower().replace(" ", "_") in _STATUS_ECHOES:
+                continue
+            return v
+        return ""
+
+
+_STATUS_ECHOES = {
+    "forbidden", "unauthorized", "bad_request", "not_found",
+    "internal_server_error", "error", "server_error", "conflict",
+}
+
+
+class AuthError(HttpError):
+    """401 — the session cookie is missing, expired, or rejected."""
+
+
+class ForbiddenError(HttpError):
+    """403 — usually "not enrolled yet" rather than a real permission issue."""
+
+
+class NotEnrolledError(HsmcliError):
+    """No playthrough for this course yet, so lifecycle ids don't exist."""
+
+
+class APIError(HttpError):
+    """A non-2xx response that isn't 401/403."""
 
 
 class TransportError(HsmcliError):
@@ -306,11 +356,13 @@ class HackSmarterAPI:
         """
         code = e.response.status_code if e.response is not None else "?"
         body = e.response.text[:400] if e.response is not None else ""
+        status = code if isinstance(code, int) else None
         if code == 401:
             raise AuthError(
-                "Authentication failed (401). Cookie may be expired. "
-                "Update it with: hsmcli config set-cookie '<paste cookie header>' "
-                "or export HSMCLI_COOKIE."
+                f"HTTP 401 on {method_up} {endpoint}: {body}. "
+                f"Cookie may be expired — hsmcli config set-cookie "
+                f"'<paste cookie header>' or export HSMCLI_COOKIE.",
+                status=status, endpoint=endpoint, body=body,
             )
         if code == 403:
             # The API returns a bare {"error":"forbidden"} for both
@@ -321,10 +373,11 @@ class HackSmarterAPI:
             m = re.search(r"/courses/([0-9a-fA-F-]{36})", endpoint)
             hint = f" Not enrolled? Try: hsmcli lab {m.group(1)} enroll" if m else ""
             raise ForbiddenError(
-                f"HTTP 403 (forbidden) on {method_up} {endpoint}: {body}.{hint}")
+                f"HTTP 403 (forbidden) on {method_up} {endpoint}: {body}.{hint}",
+                status=status, endpoint=endpoint, body=body,
+            )
         raise APIError(f"HTTP {code} on {method_up} {endpoint}: {body}",
-                       status=code if isinstance(code, int) else None,
-                       endpoint=endpoint, body=body)
+                       status=status, endpoint=endpoint, body=body)
 
     # ── session ───────────────────────────────────────────────────────────
     def session_summary(self) -> Optional[Dict[str, Any]]:
@@ -408,6 +461,21 @@ class HackSmarterAPI:
         data = self._request("GET", f"/api/student/courses/{course_id}/take")
         self._take_cache[course_id] = data
         return data
+
+    def course_name(self, course_id: str) -> str:
+        """A lab's display name, or ``""`` if we can't get one.
+
+        Reads the cached /take payload, so it's free for any command that
+        already touched the lifecycle endpoints. Purely cosmetic — a lab we
+        can't name is still perfectly operable by id — so every failure
+        (not enrolled, network down) degrades to the empty string rather
+        than sinking the command that wanted a nice header.
+        """
+        try:
+            take = self.get_course_take(course_id, use_cache=True)
+        except Exception:
+            return ""
+        return str(_take_course(take).get("name") or "")
 
     def enroll_course(self, course_id: str) -> Dict[str, Any]:
         return self._request("POST", f"/api/student/courses/{course_id}/enroll")

@@ -8,8 +8,64 @@ All notable changes to this project. Format loosely follows
 
 ### Changed
 
-- **`lab info` is now a working view, not a dump.** It prints the header,
-  the objective/scope, the flags and the live systems — the four things you
+- **Output is written for a person now.** The API's internal vocabulary is
+  translated on the way out — `na` and `not_launched` read as `off`,
+  `in_progress` as `in progress`, `unanswered` as `unsolved` — and lab names
+  lose the `Challenge Lab:` prefix and `(Easy)` suffix that the difficulty
+  and category columns already carry. `--json` / `--yaml` are untouched:
+  they still emit HackSmarter's own spelling, so scripts keep matching on
+  `running`.
+- **Every command ends by naming the next one.** `enroll` points at
+  `launch`, `launch` at `vpn` (with the `openvpn` line and an `nmap` at the
+  IP it just got), `vpn` at `openvpn`, a solved flag at the remaining one.
+  Suggestions quote the identifier you typed, not the resolved UUID.
+- **Errors say what went wrong and what fixes it.** A 403 was printed as
+  `HTTP 403 (forbidden) on GET /api/student/courses/<uuid>/take:
+  {"error":"forbidden","message":"Forbidden"}. Not enrolled? Try: hsmcli lab
+  <uuid> enroll`; it now reads `✗ You're not enrolled in dark` followed by
+  `→ hsmcli lab dark enroll`. Expired cookies, rate limits, HackSmarter-side
+  5xx and being offline each get their own wording. The technical string is
+  still on the exception for `--debug` and bug reports.
+- **Errors and their hints go to stderr**, so `--json > out.json` can't pick
+  up prose.
+- **Tables only show columns that carry information.** Machine UUIDs appear
+  when there's more than one machine to tell apart, expiry when the lab sets
+  one, points when the lab scores its flags; `match_type` (always `exact`)
+  is gone. The lab card puts the name in its border instead of repeating it
+  three ways, and `runtime: 80h·GB` reads as `80 GB-hours of runtime
+  included`.
+- **Panels and tables stop at 100 columns** instead of stretching across a
+  200-column terminal.
+- **`lab <name> vpn` writes `./dark.ovpn`**, not
+  `./hsm-bb164cba-ddc9-4cb0-8e95-ad4853d0143c.ovpn`. `lab <name> image` is
+  named after the lab too. `-o` still overrides.
+- **`launch --wait` shows a spinner** carrying the current state and elapsed
+  time, keeps one permanent line per state change, and reports how long the
+  machine took.
+- `notifications`, `events`, `subscriptions`, `orgs`, `bundles` and `exams`
+  render a table instead of dumping raw JSON. `--json` for every field.
+- `config show` reports whether the session is usable and for how much
+  longer, instead of printing 40 characters of the cookie. `set-cookie`
+  names who you just signed in as.
+- `hsmcli` with no arguments prints a short getting-started card rather than
+  the full argparse help; the sign-in step drops off once you're signed in.
+- `enroll` no longer prints `{"success": true}` under the ✓.
+
+### Added
+
+- `--version`, and `--no-color` (`NO_COLOR` is honoured too — as is a
+  non-terminal stdout, which now drops the styling automatically).
+- Ctrl-C during a launch poll exits 130 with a one-line note instead of a
+  traceback.
+- Commands that need a session say so up front instead of letting the first
+  call come back 401.
+- `HttpError`, a shared base for `AuthError` / `ForbiddenError` /
+  `APIError`, so every failed call carries `.status`, `.endpoint` and
+  `.body`. `.server_message()` returns the API's own explanation with bare
+  restatements of the status code ("Forbidden") filtered out.
+
+- **`lab info` is a working view, not a dump.** It prints the header, the
+  objective/scope, the flags and the live systems — the four things you
   need while on the box. The chapter table, lesson briefing, community
   walkthrough links (spoilers) and bundle pricing moved behind `--chapters`,
   `--briefing`, `--writeups` and `--bundles`; `--all` shows everything.
@@ -20,6 +76,9 @@ All notable changes to this project. Format loosely follows
 
 ### Fixed
 
+- **`python -m hsmcli` always exited 0**, even on failure — it called
+  `main()` without `sys.exit()`, so every error looked like a success to a
+  script. The installed `hsmcli` entry point was never affected.
 - **`launch` failed on a lab that was already up or still booting.** It
   powered on unconditionally; the server answers that with "System is
   already running", or a 400 while the instance is still provisioning, so a

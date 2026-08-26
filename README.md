@@ -78,7 +78,8 @@ hsmcli lab <name> launch                # /launch + /power on, then poll until r
 hsmcli lab <name> launch --no-wait      # return immediately after /power ACKs
 hsmcli lab <name> stop                  # /power off
 hsmcli lab <name> reset                 # /reset (new IP assigned)
-hsmcli lab <name> vpn -o me.ovpn        # download OpenVPN config
+hsmcli lab <name> vpn                   # download OpenVPN config to ./<lab>.ovpn
+hsmcli lab <name> vpn -o me.ovpn        # …or wherever you want it
 hsmcli lab <name> image                 # download the lab thumbnail (--url-only to just print the URL)
 
 # AWS labs (Second, Beanstalk, Rotation, …) — same verbs, IAM keys instead of an IP
@@ -107,6 +108,42 @@ payload — so it composes with the normal output:
 ```bash
 hsmcli --debug labs list --json > labs.json 2> trace.log
 ```
+
+`--no-color` (or `NO_COLOR=1`) drops the ANSI styling; colour is off
+automatically when output isn't a terminal. `--version` prints the version.
+
+### What it looks like
+
+Human output is written for the middle of an engagement, not for a demo.
+Every command ends by naming what you'd plausibly do next:
+
+```console
+$ hsmcli lab dark launch
+✓ Starting Dark
+
+  08:23:18  booting
+  08:23:25  running  10.0.23.197
+✓ Dark is up at 10.0.23.197  (23s)
+Next:
+  → hsmcli lab dark vpn        download the VPN profile
+  → sudo openvpn dark.ovpn     connect to the lab network
+  → nmap -sVC -T4 10.0.23.197  start looking
+```
+
+Failures name the fix rather than the plumbing, and the fix quotes the
+name you typed:
+
+```console
+$ hsmcli lab dark launch
+✗ You're not enrolled in dark, so HackSmarter won't share it yet.
+  → hsmcli lab dark enroll  free, and takes a second
+```
+
+Error messages and their follow-up commands go to **stderr**, so
+`--json > out.json` never picks up prose. The API's own vocabulary
+(`na`, `in_progress`, `not_launched`) is translated for human output only:
+`--json` always emits exactly what HackSmarter said, so scripts keep
+matching on `running`.
 
 ### Name resolution
 
@@ -263,7 +300,8 @@ that need it), so there's nothing to work around. If that ever changes,
 |---|---|
 | 0 | success |
 | 1 | the request failed (auth, HTTP error, network) |
-| 2 | your invocation was wrong — bad/missing action, ambiguous name, no match |
+| 2 | your invocation was wrong — bad/missing action, ambiguous name, no match, not enrolled |
+| 130 | interrupted (Ctrl-C) |
 
 `launch --wait` returns 2 on timeout as well: the machine may still be
 coming up, so it isn't a failure.
@@ -289,9 +327,12 @@ except HsmcliError:
     ...   # anything else this client raises
 ```
 
-`HsmcliError` is the base; `AuthError` (401), `ForbiddenError` (403),
-`NotEnrolledError`, `APIError` (carries `.status`, `.endpoint`, `.body`) and
-`TransportError` derive from it. All subclass `Exception`.
+`HsmcliError` is the base. `HttpError` carries `.status`, `.endpoint`,
+`.body` and `.server_message()` (the API's own explanation, with bare
+restatements of the status code filtered out); `AuthError` (401),
+`ForbiddenError` (403) and `APIError` (everything else) derive from it.
+`NotEnrolledError` and `TransportError` come straight off `HsmcliError`.
+All subclass `Exception`.
 
 ## Tests
 

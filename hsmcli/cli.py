@@ -18,13 +18,12 @@ Commands:
 """
 
 import argparse
-import os
 import re
 import shlex
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
-from rich.console import Console, Group
+from rich.console import Group
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.table import Table
@@ -32,7 +31,14 @@ from rich.text import Text
 
 from .api_client import (
     AUTH_COOKIE_BASE,
+    AuthError,
+    ForbiddenError,
     HackSmarterAPI,
+    HttpError,
+    NotEnrolledError,
+    TransportError,
+    client_version,
+    decode_supabase_session,
     detect_public_ip,
     parse_cookie_header,
 )
@@ -43,68 +49,39 @@ from .resolvers import (
     _item_name,
     all_lab_items,
     is_uuid,
+    resolve_course,
     resolve_course_id,
     resolve_from_list,
     resolve_system_id,
 )
+from .ui import (
+    DIFFICULTY_STYLE,
+    QUESTION_STATE_STYLE,
+    STATE_STYLE,
+    badge as _badge,
+    console,
+    disable_color,
+    human_duration,
+    info_err,
+    human_state,
+    lab_display_name,
+    quote_arg,
+    slugify,
+    split_lab_name as _split_name,
+    steps,
+)
 from .utils import (
-    Colors,
     format_datetime,
-    format_difficulty,
     format_time_left,
     print_error,
     print_info,
     print_json,
     print_output,
     print_success,
-    print_table,
     print_warning,
     print_yaml,
     truncate,
 )
-
-
-console = Console()
-
-
-DIFFICULTY_STYLE = {
-    "easy": "green", "beginner": "green",
-    "medium": "yellow", "intermediate": "yellow",
-    "hard": "red", "advanced": "red", "expert": "red",
-    "insane": "magenta",
-}
-
-STATE_STYLE = {
-    "completed": "green",
-    "in_progress": "cyan",
-    "owned": "bright_blue",
-    "not_started": "dim",
-    "unowned": "dim",
-    "lapsed": "yellow",
-    "running": "green",
-    "provisioning": "yellow",
-    "starting": "yellow",
-    "stopped": "dim",
-    "not_launched": "dim",
-    "error": "red",
-    "failed": "red",
-    # AWS-lab states: "na" = never started / torn down, "ready" = terraform
-    # applied and the IAM keys are live.
-    "ready": "green",
-    "na": "dim",
-    "creating": "yellow",
-    "updating": "yellow",
-    "pending": "yellow",
-    "destroying": "yellow",
-    "stopping": "yellow",
-    "destroyed": "dim",
-    "unknown": "red",
-}
-
-
-def _badge(text: str, palette: dict, default: str = "white") -> Text:
-    style = palette.get(str(text or "").lower(), default)
-    return Text(str(text or "—"), style=style)
 
 
 # ── helpers ───────────────────────────────────────────────────────────────
@@ -121,14 +98,89 @@ def _course_label(item: Dict[str, Any]) -> str:
     return _item_name(item) or (_item_id(item) or "?")
 
 
+def _resolve_lab(api: HackSmarterAPI, args) -> Tuple[str, str]:
+    """``(course_id, display name)`` for ``hsmcli lab <identifier> …``.
+
+    The name is what the command prints back at the user ("Launching
+    Dark"), and it falls back through what the user typed → what /take
+    calls the lab → the id, so it degrades to something usable rather than
+    to an empty string.
+    """
+    course_id, name = resolve_course(api, args.identifier)
+    if not name:
+        name = api.course_name(course_id)
+    return course_id, lab_display_name(name) or course_id
+
+
+def _lab_cmd(args, action: str) -> str:
+    """A copy-pasteable ``hsmcli lab <what they typed> <action>``.
+
+    Suggestions echo the identifier the user typed rather than the resolved
+    UUID — they asked for "dark", and a hint they can't retype without
+    scrolling back isn't a hint.
+    """
+    return f"hsmcli lab {quote_arg(getattr(args, 'identifier', '') or '<lab>')} {action}"
+
+
 # ── config ────────────────────────────────────────────────────────────────
 
+def _cookie_summary(config: Config) -> Text:
+    """Whether the stored cookie is usable, and for how much longer.
+
+    "cookie: eyJhbGciOiJIUzI1NiIs…(truncated)" answered a question nobody
+    asks. The one people do ask — "is my session still good?" — is
+    answerable from the token itself.
+    """
+    import os
+    from datetime import datetime, timezone
+
+    cookie = config.get_cookie()
+    if not cookie:
+        return Text("not set", style="yellow")
+
+    t = Text()
+    t.append("set", style="green")
+    if os.getenv("HSMCLI_COOKIE"):
+        t.append("  (from $HSMCLI_COOKIE, overriding the file)", style="dim")
+
+    parsed = parse_cookie_header(cookie)
+    chunks = sum(1 for k in parsed if k.startswith(AUTH_COOKIE_BASE))
+    if not chunks:
+        t.append(f"  — but no {AUTH_COOKIE_BASE} cookie in it", style="yellow")
+        return t
+
+    session = decode_supabase_session(parsed) or {}
+    user = (session.get("user") or {}).get("email")
+    if user:
+        t.append(f"  {user}", style="dim")
+    expires = session.get("expires_at")
+    if expires:
+        try:
+            left = (datetime.fromtimestamp(int(expires), tz=timezone.utc)
+                    - datetime.now(timezone.utc)).total_seconds()
+        except (ValueError, OSError, OverflowError):
+            return t
+        if left <= 0:
+            t.append("  · expired", style="bold red")
+        else:
+            t.append(f"  · {human_duration(left)} left", style="dim")
+    return t
+
+
 def cmd_config_show(config: Config, args) -> int:
-    data = config.get_all()
-    if "cookie" in data:
-        data = {**data, "cookie": data["cookie"][:40] + "…(truncated)"}
-    print_info(f"Config file: {config.get_config_path()}")
-    print_json(data)
+    t = Table(show_header=False, box=None, padding=(0, 2))
+    t.add_column("field", style="dim")
+    # fold, not ellipsis: a config path you can't read is no use, and this
+    # panel exists to be copied out of.
+    t.add_column("value", overflow="fold")
+    t.add_row("session", _cookie_summary(config))
+    t.add_row("site", config.get_base_url())
+    t.add_row("output", config.get_output_format())
+    t.add_row("config", config.get_config_path())
+    console.print(Panel(t, title="hsmcli config", title_align="left",
+                        border_style="cyan", padding=(0, 1)))
+    if not config.get_cookie():
+        steps(("hsmcli config set-cookie '<paste Cookie header>'", "sign in"))
     return 0
 
 
@@ -157,8 +209,17 @@ def cmd_config_set_cookie(config: Config, args) -> int:
             f"likely fail. Saving anyway."
         )
     config.set_cookie(cookie)
-    print_success(f"Cookie saved ({len(parsed)} cookie(s), "
-                  f"{chunks} auth chunk(s)).")
+
+    # Name who we just signed in as. It's the difference between "something
+    # was written to a file" and "you are logged in", and it catches the
+    # classic mistake of copying the cookie from the wrong browser profile.
+    session = decode_supabase_session(parsed) or {}
+    who = ((session.get("user") or {}).get("email")
+           or ((session.get("user") or {}).get("user_metadata") or {})
+           .get("preferred_username"))
+    print_success(f"Signed in as {who}" if who else "Cookie saved.")
+    steps(("hsmcli whoami", "confirm the session"),
+          ("hsmcli labs list", "see your labs"))
     return 0
 
 
@@ -204,45 +265,74 @@ def cmd_whoami(api: HackSmarterAPI, config: Config, args) -> int:
         print_yaml(payload)
         return 0
 
-    print(f"{Colors.BOLD}Session{Colors.END}")
-    if session:
-        for k in ("username", "email", "id", "provider", "expires_at"):
-            v = session.get(k)
-            if v is not None:
-                print(f"  {k:<11} {v}")
-    else:
-        print_warning("  No decoded session — set a cookie via 'hsmcli config set-cookie'")
-
-    print()
-    print(f"{Colors.BOLD}Profile{Colors.END}")
-    if isinstance(profile, dict) and "error" in profile:
-        print_error(f"  {profile['error']}")
+    if not session:
+        print_warning("No decoded session — the stored cookie isn't a "
+                      "HackSmarter one.")
+        steps(("hsmcli config set-cookie '<paste Cookie header>'",
+               "log in again"), to_stderr=True)
         return 1
+
+    body = Text()
+    for label, key in (("user", "username"), ("email", "email"),
+                       ("login", "provider"), ("id", "id")):
+        v = session.get(key)
+        if v is None:
+            continue
+        if body:
+            body.append("\n")
+        body.append(f"{label:<8}", style="dim")
+        body.append(str(v), style="bold white" if key == "username" else "")
+
+    expires = session.get("expires_at")
+    if expires:
+        # expires_at is a unix timestamp on this payload, not ISO8601.
+        from datetime import datetime, timezone
+        try:
+            when = datetime.fromtimestamp(int(expires), tz=timezone.utc)
+            left = (when - datetime.now(timezone.utc)).total_seconds()
+            body.append("\n")
+            body.append(f"{'session':<8}", style="dim")
+            if left <= 0:
+                body.append("expired — set a fresh cookie", style="bold red")
+            else:
+                body.append(f"valid for {human_duration(left)}", style="green")
+        except (ValueError, OSError, OverflowError):
+            pass
+
+    console.print(Panel(body, title="Signed in", title_align="left",
+                        border_style="cyan", padding=(0, 2)))
+
+    if isinstance(profile, dict) and "error" in profile:
+        print_error(f"Couldn't load your profile: {profile['error']}")
+        return 1
+
     data = profile.get("data", profile) if isinstance(profile, dict) else profile
     # HackSmarter wraps the payload as {"profile": {...}}; unwrap once so
     # scalar rendering shows the fields the user actually cares about.
     if isinstance(data, dict) and set(data.keys()) == {"profile"} and isinstance(data["profile"], dict):
         data = data["profile"]
     if isinstance(data, dict) and data:
-        # Show scalars inline, then a note for any nested subtrees so nothing
-        # renders as blank when everything is nested.
-        nested_keys = []
-        printed_any = False
-        for k, v in data.items():
-            if isinstance(v, (dict, list)):
-                nested_keys.append(k)
-                continue
-            print(f"  {k:<20} {truncate(v, 80)}")
-            printed_any = True
-        if nested_keys:
-            print(f"  {Colors.CYAN}nested:{Colors.END}          "
-                  f"{', '.join(nested_keys)}  (use --json to see)")
-        if not printed_any and not nested_keys:
+        scalars = [(k, v) for k, v in data.items()
+                   if not isinstance(v, (dict, list))]
+        nested = [k for k, v in data.items() if isinstance(v, (dict, list))]
+        if scalars:
+            t = Table(show_header=False, box=None, padding=(0, 2))
+            t.add_column("field", style="dim")
+            t.add_column("value")
+            for k, v in scalars:
+                t.add_row(str(k), truncate(v, 70))
+            console.print(Panel(t, title="Profile", title_align="left",
+                                border_style="dim", padding=(0, 1)))
+        if nested:
+            print_info(f"{len(nested)} nested "
+                       f"{'field' if len(nested) == 1 else 'fields'} not shown: "
+                       f"{', '.join(nested)} — pass --json to see them")
+        if not scalars and not nested:
             print_json(data)
     elif data:
         print_json(data)
     else:
-        print_warning("  (empty profile response)")
+        print_warning("Your profile came back empty.")
     return 0
 
 
@@ -286,20 +376,45 @@ def _extract_state(item: Dict[str, Any]) -> str:
     return ""
 
 
+_CATEGORY_LABELS = {
+    "challenge": "challenge",
+    "guided": "guided",
+    "range": "range",
+    "hackwith": "hack-with-me",
+    "foundations": "foundations",
+    "other": "course",
+}
+
+
 def _render_labs_table(items: List[Dict[str, Any]], title: str = "Labs"):
-    t = Table(title=title, show_header=True,
+    """One row per lab: bare name, difficulty, where you are with it.
+
+    The name is stripped of its ``Challenge Lab:`` prefix and ``(Easy)``
+    suffix — both are rendered in their own right (the suffix as the
+    Difficulty column), and repeating them costs a third of the width in a
+    list where every prefix is identical. The Type column only appears when
+    the list actually spans categories, i.e. under ``-c all``.
+    """
+    cats = {_lab_category(_item_name(it)) for it in items}
+    show_type = len(cats) > 1
+    t = Table(title=title, title_justify="left", show_header=True,
               header_style="bold", border_style="dim")
     t.add_column("#", justify="right", style="dim")
-    t.add_column("Name")
+    t.add_column("Lab")
+    if show_type:
+        t.add_column("Type", style="dim")
     t.add_column("Difficulty")
-    t.add_column("State")
+    t.add_column("Progress")
     for i, it in enumerate(items, 1):
-        t.add_row(
-            str(i),
-            truncate(_item_name(it), 60),
-            _badge(_extract_difficulty(it) or "—", DIFFICULTY_STYLE),
-            _badge(_extract_state(it) or "—", STATE_STYLE),
-        )
+        name = _item_name(it)
+        row: List[Any] = [str(i), truncate(lab_display_name(name), 48)]
+        if show_type:
+            row.append(_CATEGORY_LABELS.get(_lab_category(name), "—"))
+        row += [
+            _badge(_extract_difficulty(it), DIFFICULTY_STYLE),
+            _badge(_extract_state(it), STATE_STYLE),
+        ]
+        t.add_row(*row)
     console.print(t)
 
 
@@ -392,16 +507,27 @@ def cmd_labs_list(api: HackSmarterAPI, config: Config, args) -> int:
 
     # Say when the default narrowing is in play. A list that quietly shows a
     # subset is exactly what hid the in-progress labs before.
-    default_note = (" — challenge labs only; -c all for everything"
-                    if not args.category else "")
+    narrowed = not args.category
 
     if not items:
-        print_warning(f"No labs match your filters{default_note}. "
-                      f"(Try --json to inspect raw response.)")
+        print_warning("No labs match those filters.")
+        steps(
+            ("hsmcli labs list -c all", "include every category") if narrowed else None,
+            ("hsmcli labs list", "clear the filters"),
+        )
         return 0
+
     _render_labs_table(items)
-    print()
-    print_info(f"{len(items)} lab(s){default_note}")
+    console.print()
+    summary = f"{len(items)} lab{'s' if len(items) != 1 else ''}"
+    if narrowed:
+        summary += " · challenge labs only"
+    print_info(summary)
+    steps(
+        ("hsmcli lab <name> info", "objective, flags and live status"),
+        ("hsmcli labs list -c all", "every category, not just challenge labs")
+        if narrowed else None,
+    )
     return 0
 
 
@@ -478,6 +604,18 @@ def _only_writeups(md: str) -> str:
 
 
 _OBJECTIVE_HEADING_RE = re.compile(r"objective|scope|goal", re.I)
+
+
+def _strip_leading_heading(md: str, pattern: re.Pattern) -> str:
+    """Drop a leading ``## Objective`` when the panel is already titled that.
+
+    Purely cosmetic: the panel border carries the title, so the same word
+    on the first line inside it is a stutter.
+    """
+    lines = (md or "").lstrip().splitlines()
+    if lines and lines[0].lstrip().startswith("#") and pattern.search(lines[0]):
+        return "\n".join(lines[1:]).lstrip()
+    return md
 
 
 def _objective_scope(md: str) -> str:
@@ -633,37 +771,40 @@ def cmd_lab_info(api: HackSmarterAPI, config: Config, args) -> int:
     want_writeups = show_all or args.writeups
     want_bundles = show_all or args.bundles
 
-    name = body.get("name") or body.get("title") or "?"
+    raw_name = body.get("name") or body.get("title") or "?"
+    category, name, _ = _split_name(raw_name)
     cid = body.get("id") or course_id
-    difficulty = _extract_difficulty(body) or "—"
-    state = body.get("state") or _extract_state(body) or "—"
+    difficulty = _extract_difficulty(body)
+    state = body.get("state") or _extract_state(body)
 
-    # Header line: name + colored difficulty + state
-    header = Text()
-    header.append(name, style="bold white")
-    header.append("  ")
-    header.append(_badge(difficulty, DIFFICULTY_STYLE))
-    header.append("  ")
-    header.append(_badge(state, STATE_STYLE))
+    # The card: what it is, how hard, how far you've got. The name goes in
+    # the border, so the difficulty and state read as attributes of it
+    # rather than as a third and fourth word in the title — that repetition
+    # ("Challenge Lab: Dark (Easy)  Easy  in_progress") was the old header.
+    card = Text()
+    card.append(_badge(difficulty or "—", DIFFICULTY_STYLE))
+    card.append("  ·  ")
+    card.append(_badge(state or "—", STATE_STYLE))
+    if category:
+        card.append(f"  ·  {category.lower()}", style="dim")
 
-    # Metadata line under the header
-    meta = Text()
-    meta.append(f"{cid}", style="dim")
-    ct = body.get("content_type")
-    if ct: meta.append(f"   type: {ct}", style="dim")
     runtime = body.get("included_runtime_gb_seconds")
     if runtime:
-        # Convert GB-seconds → hours per GB assumption
-        hrs = int(runtime) / 3600
-        meta.append(f"   runtime: {int(hrs):,}h·GB", style="dim")
+        # GB-seconds is how the API bills lab uptime: a 1 GB machine
+        # running for an hour spends one GB-hour.
+        try:
+            card.append(f"\n{int(runtime) / 3600:,.0f} GB-hours of runtime included",
+                        style="dim")
+        except (TypeError, ValueError):
+            pass
+    card.append(f"\n{cid}", style="dim")
 
-    lines = [header, "\n", meta]
     image_path = body.get("image_path")
     if image_path and show_all:
-        lines += ["\n", Text(f"image: {api.image_url(image_path)}", style="dim")]
+        card.append(f"\n{api.image_url(image_path)}", style="dim")
 
     console.print()
-    console.print(Panel(Text.assemble(*lines),
+    console.print(Panel(card, title=name or raw_name, title_align="left",
                         border_style="cyan", padding=(0, 2)))
 
     # Objective / scope — description_markdown carries the real brief; the
@@ -674,11 +815,13 @@ def cmd_lab_info(api: HackSmarterAPI, config: Config, args) -> int:
     desc_md = _drop_writeups(full_desc) if show_all else _objective_scope(full_desc)
     desc_plain = body.get("description") or ""
     if desc_md:
+        desc_md = _strip_leading_heading(desc_md, _OBJECTIVE_HEADING_RE)
         console.print(Panel(Markdown(desc_md, hyperlinks=False),
-                            title="Objective / scope",
+                            title="Objective", title_align="left",
                             border_style="dim", padding=(0, 2)))
     elif desc_plain:
-        console.print(Panel(desc_plain.strip(), title="Objective / scope",
+        console.print(Panel(desc_plain.strip(), title="Objective",
+                            title_align="left",
                             border_style="dim", padding=(0, 2)))
 
     # Chapters / lessons — off by default: a challenge lab is one chapter
@@ -702,15 +845,25 @@ def cmd_lab_info(api: HackSmarterAPI, config: Config, args) -> int:
     # Everything below rides on /take: the flags, the lesson content and the
     # ids the live-status lookup needs. One fetch, one failure message.
     take: Any = None
-    take_error: Optional[str] = None
+    take_error: Optional[Exception] = None
     try:
         take = api.get_course_take(course_id, use_cache=True)
     except Exception as e:
-        take_error = str(e)
+        take_error = e
 
-    if take_error:
-        console.print(f"[dim]flags, lesson content and system status "
-                      f"unavailable: {take_error}[/dim]")
+    machines: List[Dict[str, Any]] = []
+    questions: List[Dict[str, Any]] = []
+
+    if take_error is not None:
+        console.print()
+        if isinstance(take_error, (ForbiddenError, NotEnrolledError)):
+            # By far the common case: the lab is on the account but has no
+            # playthrough yet, so /take won't serve the flags or the
+            # machines. That's one command away from fixed.
+            print_warning("Flags and live status need you enrolled in this lab.")
+            steps((_lab_cmd(args, "enroll"), "takes a second, no cost"))
+        else:
+            print_warning(f"Flags and live status unavailable: {take_error}")
     else:
         if want_briefing:
             _render_briefing(api, take, full=getattr(args, "full", False))
@@ -725,17 +878,18 @@ def cmd_lab_info(api: HackSmarterAPI, config: Config, args) -> int:
             if api.lab_kind(course_id) == "aws":
                 aws_labs = api.get_aws_labs(course_id)
                 if aws_labs:
-                    _render_aws_table(aws_labs, title="AWS labs (live status)")
+                    _render_aws_table(aws_labs, title="AWS lab")
+                    machines = aws_labs
                     for lab in aws_labs:
                         if _aws_state(lab) in AWS_READY_STATES:
                             _render_aws_creds(lab)
             else:
                 sys_payload = api.get_lab_systems(course_id)
-                sys_items = _flatten_lab_items(_extract_items(sys_payload))
-                if sys_items:
-                    _render_systems_table(sys_items, title="Systems (live status)")
+                machines = _flatten_lab_items(_extract_items(sys_payload))
+                if machines:
+                    _render_systems_table(machines, title="Machines")
         except Exception as e:
-            console.print(f"[dim]systems status unavailable: {e}[/dim]")
+            print_warning(f"Live machine status unavailable: {e}")
 
         if want_writeups:
             _render_writeups(api, take, body)
@@ -752,7 +906,38 @@ def cmd_lab_info(api: HackSmarterAPI, config: Config, args) -> int:
             ))
         else:
             print_info("No bundle pricing listed for this lab.")
+
+    if take_error is None:
+        console.print()
+        steps(*_info_next_steps(args, machines, questions))
     return 0
+
+
+def _info_next_steps(args, machines: List[Dict[str, Any]],
+                     questions: List[Dict[str, Any]]) -> List[Any]:
+    """The two or three commands that make sense from where this lab is.
+
+    Reading a lab card is never the goal — starting the box, getting on the
+    VPN or submitting a flag is. Which of those applies is knowable from
+    the state we just rendered, so say it rather than making the reader map
+    the state table back onto the command list.
+    """
+    running = [m for m in machines
+               if (_aws_state(m) if "aws_lab_id" in m else _system_status(m))
+               in RUNNING_STATES]
+    is_aws = any("aws_lab_id" in m for m in machines)
+    out: List[Any] = []
+    if machines and not running:
+        out.append((_lab_cmd(args, "launch"),
+                    "start it" + ("" if is_aws else " and wait for the IP")))
+    elif running and not is_aws:
+        out.append((_lab_cmd(args, "vpn"), "download the VPN profile"))
+        out.append((_lab_cmd(args, "stop"), "power it off when you're done"))
+    elif running and is_aws:
+        out.append((_lab_cmd(args, "creds"), "show the IAM keys again"))
+    if any((q.get("state") or "").lower() != "correct" for q in questions):
+        out.append((_lab_cmd(args, "submit user '<flag>'"), "submit a flag"))
+    return out
 
 
 def cmd_lab_take(api: HackSmarterAPI, config: Config, args) -> int:
@@ -764,14 +949,16 @@ def cmd_lab_take(api: HackSmarterAPI, config: Config, args) -> int:
 
 
 def cmd_lab_enroll(api: HackSmarterAPI, config: Config, args) -> int:
-    course_id = resolve_course_id(api, args.identifier)
+    course_id, label = _resolve_lab(api, args)
     data = api.enroll_course(course_id)
     fmt = _format_choice(args, config)
     if fmt in ("json", "yaml"):
         print_output(data, fmt); return 0
-    print_success(f"Enrolled in course {course_id}")
-    if isinstance(data, dict) and data:
-        print_json(data)
+    # The reply is `{"success": true}` — printing it back added a line of
+    # JSON that says exactly what the ✓ already said.
+    print_success(f"Enrolled in {label}")
+    steps((_lab_cmd(args, "launch"), "start the machine"),
+          (_lab_cmd(args, "info"), "objective, flags and live status"))
     return 0
 
 
@@ -870,41 +1057,65 @@ def _system_ip(item: Dict[str, Any]) -> str:
     return ""
 
 
-def _render_systems_table(items: List[Dict[str, Any]], title: str = "Systems"):
-    t = Table(title=title, show_header=True,
+def _render_systems_table(items: List[Dict[str, Any]], title: str = "Machines",
+                          show_ids: Optional[bool] = None):
+    """The live machine list.
+
+    Columns appear only when they carry information: the UUID column is for
+    telling several machines apart when you have to name one with
+    ``--system``, and the expiry column only exists on labs that set a
+    deadline. On the common single-machine lab that leaves name, state and
+    the IP you're about to nmap — which is the whole point of the table.
+    """
+    if show_ids is None:
+        show_ids = len(items) > 1
+    show_expiry = any(
+        (it.get("expires_at") or (it.get("instance") or {}).get("expires_at"))
+        for it in items
+    )
+    networks = {it.get("_network") for it in items if it.get("_network")}
+    show_network = len(networks) > 1
+
+    t = Table(title=title, title_justify="left", show_header=True,
               header_style="bold", border_style="dim")
     t.add_column("#", justify="right", style="dim")
-    t.add_column("Name")
-    t.add_column("ID", style="dim")
+    t.add_column("Machine")
+    if show_network:
+        t.add_column("Network", style="dim")
     t.add_column("Status")
-    t.add_column("IP")
-    t.add_column("Expires")
+    t.add_column("IP", style="bold cyan")
+    if show_ids:
+        t.add_column("ID", style="dim")
+    if show_expiry:
+        t.add_column("Expires", style="dim")
+
     for i, it in enumerate(items, 1):
         instance = it.get("instance") or {}
-        status = _system_status(it)
         expires = str(it.get("expires_at") or instance.get("expires_at") or "")
-        t.add_row(
-            str(i),
-            truncate(_item_name(it), 40),
-            _item_id(it) or "",
-            _badge(status, STATE_STYLE),
-            _system_ip(it) or "—",
-            format_datetime(expires) if expires else "—",
-        )
+        row: List[Any] = [str(i), truncate(_item_name(it), 32)]
+        if show_network:
+            row.append(truncate(it.get("_network") or "—", 20))
+        row.append(_badge(_system_status(it), STATE_STYLE))
+        row.append(_system_ip(it) or "—")
+        if show_ids:
+            row.append(_item_id(it) or "—")
+        if show_expiry:
+            row.append(format_datetime(expires) if expires else "—")
+        t.add_row(*row)
     console.print(t)
 
 
 def cmd_lab_systems(api: HackSmarterAPI, config: Config, args) -> int:
     fmt = _format_choice(args, config)
-    course_id = resolve_course_id(api, args.identifier)
+    course_id, label = _resolve_lab(api, args)
     if api.lab_kind(course_id) == "aws":
         labs = api.get_aws_labs(course_id)
         if fmt in ("json", "yaml"):
             print_output(labs, fmt); return 0
         if not labs:
-            print_warning("No AWS labs returned.")
+            print_warning(f"{label} has no AWS labs.")
             return 0
-        _render_aws_table(labs, title=f"AWS labs — {course_id}")
+        _render_aws_table(labs, title=f"AWS labs — {label}")
         return 0
     payload = api.get_lab_systems(course_id)
     # Keep raw for --json (users may want the network wrapper visible);
@@ -916,32 +1127,38 @@ def cmd_lab_systems(api: HackSmarterAPI, config: Config, args) -> int:
     if fmt == "yaml":
         print_yaml(raw_items if raw_items else payload); return 0
     if not items:
-        print_warning("No systems returned. Try --json to inspect raw response.")
+        print_warning(f"{label} has no machines to show.")
+        steps((_lab_cmd(args, "enroll"), "if you haven't enrolled yet"),
+              (_lab_cmd(args, "systems --json"), "inspect the raw response"))
         return 0
-    _render_systems_table(items, title=f"Systems — {course_id}")
+    # Show ids only when they're ids you could pass to `--system`. A
+    # networks lab's inner machines were expanded out of a wrapper, and
+    # their ids aren't addressable by /power — printing them in a column
+    # next to a name invites exactly the command that won't work.
+    _render_systems_table(items, title=f"Machines — {label}",
+                          show_ids=len(items) == len(raw_items))
     return 0
 
 
 def cmd_lab_status(api: HackSmarterAPI, config: Config, args) -> int:
     """Compact 'is my lab on?' check for one lab."""
     fmt = _format_choice(args, config)
-    course_id = resolve_course_id(api, args.identifier)
+    course_id, label = _resolve_lab(api, args)
     if api.lab_kind(course_id) == "aws":
         labs = api.get_aws_labs(course_id)
         if fmt in ("json", "yaml"):
             print_output(labs, fmt); return 0
         if not labs:
-            print_warning("No AWS labs in this course.")
+            print_warning(f"{label} has no AWS labs.")
             return 0
         ready = [l for l in labs if _aws_state(l) in AWS_READY_STATES]
-        header = Text()
-        header.append(f"{len(ready)}/{len(labs)} AWS lab(s) ready",
-                      style="green" if ready else "dim")
-        console.print(Panel(header, border_style="green" if ready else "dim",
-                            padding=(0, 2)))
+        _render_status_headline(label, len(ready), len(labs), "ready",
+                                noun="environment")
         _render_aws_table(labs, title="Live status")
         for lab in ready:
             _render_aws_creds(lab)
+        if not ready:
+            steps((_lab_cmd(args, "launch"), "provision it"))
         return 0
     payload = api.get_lab_systems(course_id)
     raw_items = _extract_items(payload)
@@ -949,18 +1166,38 @@ def cmd_lab_status(api: HackSmarterAPI, config: Config, args) -> int:
     if fmt in ("json", "yaml"):
         print_output(raw_items if raw_items else payload, fmt); return 0
     if not items:
-        print_warning("No systems in this lab.")
+        print_warning(f"{label} has no machines.")
+        steps((_lab_cmd(args, "enroll"), "if you haven't enrolled yet"))
         return 0
 
-    running = [it for it in items if _system_status(it) in
-               ("running", "provisioning", "starting")]
-    header = Text()
-    header.append(f"{len(running)}/{len(items)} systems running",
-                  style="green" if running else "dim")
-    console.print(Panel(header, border_style="green" if running else "dim",
-                        padding=(0, 2)))
+    up = [it for it in items if _system_status(it) in RUNNING_STATES]
+    booting = [it for it in items if _system_status(it) in BOOTING_STATES]
+    _render_status_headline(label, len(up), len(items), "up",
+                            pending=len(booting))
     _render_systems_table(items, title="Live status")
+    if not up and not booting:
+        steps((_lab_cmd(args, "launch"), "start it"))
+    elif len(up) == 1 and not booting:
+        ip = _system_ip(up[0])
+        steps((_lab_cmd(args, "vpn"), "download the VPN profile") if ip else None,
+              (_lab_cmd(args, "stop"), "power it off when you're done"))
     return 0
+
+
+def _render_status_headline(label: str, ready: int, total: int, word: str,
+                            pending: int = 0, noun: str = "machine") -> None:
+    """One line you can read at a glance: ``Dark · 1/1 machines up``."""
+    t = Text()
+    t.append(label, style="bold white")
+    t.append("  ·  ", style="dim")
+    style = "green" if ready else ("yellow" if pending else "dim")
+    t.append(f"{ready}/{total} {noun}{'' if total == 1 else 's'} {word}",
+             style=style)
+    if pending:
+        t.append(f"  ({pending} booting)", style="yellow")
+    # expand=False keeps the box around the sentence instead of stretching a
+    # five-word headline across the whole terminal.
+    console.print(Panel(t, border_style=style, padding=(0, 2), expand=False))
 
 
 RUNNING_STATES = ("running", "ready", "active")
@@ -978,14 +1215,15 @@ def _lookup_target(api: HackSmarterAPI, course_id: str,
 def cmd_lab_launch(api: HackSmarterAPI, config: Config, args) -> int:
     import time
     fmt = _format_choice(args, config)
-    course_id = resolve_course_id(api, args.identifier)
+    course_id, label = _resolve_lab(api, args)
 
     # AWS labs have no VM to power on — different endpoint, different
     # payload, credentials instead of an IP.
     if api.lab_kind(course_id) == "aws":
-        return _cmd_lab_launch_aws(api, config, args, course_id)
+        return _cmd_lab_launch_aws(api, config, args, course_id, label)
 
     current: Optional[Dict[str, Any]] = None   # live wrapper, when we have it
+    target = label
     if args.system:
         system_id = resolve_system_id(api, course_id, args.system)
     else:
@@ -996,16 +1234,21 @@ def cmd_lab_launch(api: HackSmarterAPI, config: Config, args) -> int:
         if len(systems) == 1:
             current = systems[0]
             system_id = _item_id(current) or ""
-            print_info(f"Auto-selected: {_course_label(current)}")
+            target = _course_label(current) or label
         elif not systems:
-            print_error("Lab has no systems/networks to launch.")
+            print_error(f"{label} has no machines to launch.")
+            steps((_lab_cmd(args, "enroll"), "if you haven't enrolled yet"),
+                  (_lab_cmd(args, "info"), "check what this lab contains"),
+                  to_stderr=True)
             return 1
         else:
-            print_error("Lab has multiple targets — specify one with --system:")
+            print_error(f"{label} has several targets — name one:")
             # Render the wrappers, not their machines: the IDs printed here
             # have to be ones --system will accept, and an inner machine id
             # is not addressable via /power.
-            _render_systems_table(systems, title="Targets")
+            _render_systems_table(systems, title="Targets", show_ids=True)
+            steps((_lab_cmd(args, f"launch {quote_arg(_course_label(systems[0]))}"),
+                   "for example"), to_stderr=True)
             return 1
 
     # Read the live state before powering anything on. The server answers a
@@ -1023,15 +1266,17 @@ def cmd_lab_launch(api: HackSmarterAPI, config: Config, args) -> int:
     if state in RUNNING_STATES:
         if fmt in ("json", "yaml"):
             print_output(current, fmt); return 0
-        print_info("Already running — nothing to launch.")
+        print_info(f"{target} is already running.")
         _render_systems_table(machines, title="Live status")
+        _launch_done_steps(args, machines, target)
         return 0
 
     booting = state in BOOTING_STATES
     if booting:
         if fmt in ("json", "yaml") and not args.wait:
             print_output(current, fmt); return 0
-        print_info(f"Already {state} — skipping the power call.")
+        print_info(f"{target} is already {human_state(state)} — "
+                   f"picking up the existing boot.")
     else:
         # Kick a heartbeat before launching so the server treats us as an
         # "active" viewer (the browser does the same on the /take page).
@@ -1043,75 +1288,127 @@ def cmd_lab_launch(api: HackSmarterAPI, config: Config, args) -> int:
         data = api.launch_system(course_id, system_id)
         if fmt in ("json", "yaml"):
             print_output(data, fmt); return 0
-        print_success(f"Launched system {system_id}")
-        if isinstance(data, dict) and data and not args.wait:
-            print_json(data)
+        print_success(f"Starting {target}")
+        if isinstance(data, dict) and data.get("message") and not args.wait:
+            print_info(str(data["message"]))
 
     if not args.wait:
-        print_info(f"Provisioning takes 2–5 min. Poll with "
-                   f"`hsmcli lab {args.identifier} status` or drop --no-wait.")
+        print_info("Machines take 2–5 minutes to come up.")
+        steps((_lab_cmd(args, "status"), "check whether it's up yet"))
         return 0
 
     # ── wait loop ────────────────────────────────────────────────────────
-    deadline = time.monotonic() + args.timeout
+    #
+    # The progress line is a spinner carrying the current state and elapsed
+    # time, with one permanent line printed per *change* of state. Polling
+    # noise stays on the spinner; what you scroll back to afterwards is the
+    # three or four lines that actually happened.
+    started = time.monotonic()
+    deadline = started + args.timeout
     last_heartbeat = 0.0
     last_state = None
+    machines = []
     console.print()
-    console.print(f"[dim]Waiting for system to come up (timeout {args.timeout}s)…[/dim]")
 
-    while time.monotonic() < deadline:
-        # A networks-lab target is a wrapper around several machines;
-        # flatten so the progress line and the final table talk about the
-        # machines the user actually connects to.
-        machines: List[Dict[str, Any]] = []
-        try:
-            it = _lookup_target(api, course_id, system_id)
-            machines = _flatten_lab_items([it]) if it else []
-            state = _system_status(it) if it else "unknown"
-            ip = _system_ip(machines[0]) if len(machines) == 1 else ""
-        except Exception as e:
-            state = f"poll-error: {e}"; ip = ""
-
-        if state != last_state:
-            stamp = time.strftime("%H:%M:%S")
-            console.print(f"  [dim]{stamp}[/dim]  ", end="")
-            console.print(_badge(state, STATE_STYLE), end="")
-            if ip:
-                console.print(f"  [cyan]{ip}[/cyan]", end="")
-            elif len(machines) > 1:
-                ready = sum(1 for m in machines
-                            if _system_status(m) in RUNNING_STATES)
-                console.print(f"  [dim]{ready}/{len(machines)} machines up[/dim]", end="")
-            console.print()
-            last_state = state
-
-        if state in RUNNING_STATES:
-            if len(machines) > 1:
-                console.print(f"[green]✓ all {len(machines)} systems are up.[/green]")
-                _render_systems_table(machines, title="Live status")
-            else:
-                console.print(f"[green]✓ system is up at {ip or '(no ip)'}.[/green]")
-            return 0
-        if state in ("error", "failed"):
-            console.print(f"[red]✗ launch failed: {state}[/red]")
-            return 1
-
-        # Keep the session "warm" — the browser heartbeats every ~10s while
-        # sitting on the /take page. Without it the server may pause the
-        # launch or refuse to progress it.
-        if time.monotonic() - last_heartbeat > 10:
+    with console.status("", spinner="dots") as spinner:
+        while time.monotonic() < deadline:
+            elapsed = time.monotonic() - started
+            # A networks-lab target is a wrapper around several machines;
+            # flatten so the progress line and the final table talk about
+            # the machines the user actually connects to.
+            poll_error = ""
             try:
-                api.heartbeat_for_course(course_id)
-            except Exception:
-                pass
-            last_heartbeat = time.monotonic()
+                it = _lookup_target(api, course_id, system_id)
+                machines = _flatten_lab_items([it]) if it else []
+                state = _system_status(it) if it else "unknown"
+                ip = _system_ip(machines[0]) if len(machines) == 1 else ""
+            except Exception as e:
+                # Keep polling — a status call that fails once says nothing
+                # about the machine — but say so on a permanent line, not on
+                # the spinner, which erases itself.
+                state = "unreadable"; ip = ""; poll_error = str(e)
 
-        time.sleep(3)
+            if state != last_state:
+                line = Text(f"  {time.strftime('%H:%M:%S')}  ", style="dim")
+                line.append(_badge(state, STATE_STYLE))
+                if poll_error:
+                    line.append(f"  {poll_error}", style="dim")
+                elif ip:
+                    line.append("  ")
+                    line.append(ip, style="bold cyan")
+                elif len(machines) > 1:
+                    up = sum(1 for m in machines
+                             if _system_status(m) in RUNNING_STATES)
+                    line.append(f"  {up}/{len(machines)} machines up",
+                                style="dim")
+                console.print(line)
+                last_state = state
 
-    console.print(f"[yellow]⚠ timeout after {args.timeout}s — last state: {last_state}[/yellow]")
-    console.print(f"[dim]The machine may still finish provisioning. Poll with "
-                  f"`hsmcli lab {args.identifier} status`.[/dim]")
+            if state in RUNNING_STATES:
+                break
+            if state in ("error", "failed"):
+                print_error(f"{target} failed to start ({human_state(state)}).")
+                steps((_lab_cmd(args, "reset"), "re-provision it"),
+                      (_lab_cmd(args, "status"), "look at the current state"),
+                      to_stderr=True)
+                return 1
+
+            spinner.update(status=Text(
+                f"  waiting for {target} — {human_state(state)}, "
+                f"{human_duration(elapsed)} elapsed", style="dim"))
+
+            # Keep the session "warm" — the browser heartbeats every ~10s
+            # while sitting on the /take page. Without it the server may
+            # pause the launch or refuse to progress it.
+            if time.monotonic() - last_heartbeat > 10:
+                try:
+                    api.heartbeat_for_course(course_id)
+                except Exception:
+                    pass
+                last_heartbeat = time.monotonic()
+
+            time.sleep(3)
+
+    took = human_duration(time.monotonic() - started)
+    if last_state in RUNNING_STATES:
+        if len(machines) > 1:
+            print_success(f"{target} is up — all {len(machines)} machines "
+                          f"({took})")
+            _render_systems_table(machines, title="Live status")
+        else:
+            ip = _system_ip(machines[0]) if machines else ""
+            t = Text()
+            t.append(f"{target} is up", style="")
+            if ip:
+                t.append(" at ")
+                t.append(ip, style="bold cyan")
+            t.append(f"  ({took})", style="dim")
+            print_success(t)
+        _launch_done_steps(args, machines, target)
+        return 0
+
+    print_warning(f"Still {human_state(last_state or 'unknown')} after {took} "
+                  f"— giving up on the wait, not on the machine.")
+    steps((_lab_cmd(args, "status"), "check again in a minute"),
+          (f"{_lab_cmd(args, 'launch')} --timeout 900", "wait longer next time"))
     return 2
+
+
+def _launch_done_steps(args, machines: List[Dict[str, Any]],
+                       label: str = "") -> None:
+    """What to do with a machine that just came up.
+
+    A running box you can't reach isn't progress — the VPN is the next step
+    every single time, and it's the one people forget.
+    """
+    ips = [ip for ip in (_system_ip(m) for m in machines) if ip]
+    steps(
+        (_lab_cmd(args, "vpn"), "download the VPN profile"),
+        (f"sudo openvpn {_vpn_filename(label or getattr(args, 'identifier', ''))}",
+         "connect to the lab network"),
+        (f"nmap -sVC -T4 {ips[0]}", "start looking") if len(ips) == 1 else None,
+        header="Next:",
+    )
 
 
 def _resolve_lab_system(api: HackSmarterAPI, args) -> tuple:
@@ -1127,43 +1424,52 @@ def _resolve_lab_system(api: HackSmarterAPI, args) -> tuple:
     systems = _extract_items(api.get_lab_systems(course_id))
     if len(systems) == 1:
         return course_id, _item_id(systems[0]) or ""
-    raise LookupError("multiple or no targets — specify one explicitly")
+    if not systems:
+        raise LookupError("this lab has no machines — enroll first, or check "
+                          "`hsmcli lab <name> info`")
+    names = ", ".join(sorted(_course_label(s) for s in systems))
+    raise LookupError(f"this lab has several machines — name one: {names}")
 
 
 def cmd_lab_stop(api: HackSmarterAPI, config: Config, args) -> int:
     fmt = _format_choice(args, config)
-    course_id = resolve_course_id(api, args.identifier)
+    course_id, label = _resolve_lab(api, args)
     if api.lab_kind(course_id) == "aws":
-        return _cmd_lab_aws_action(api, config, args, course_id, "stop")
+        return _cmd_lab_aws_action(api, config, args, course_id, "stop", label)
     course_id, system_id = _resolve_lab_system(api, args)
     data = api.power_off_system(course_id, system_id)
     if fmt in ("json", "yaml"):
         print_output(data, fmt); return 0
-    print_success(f"Powered off system {system_id}")
+    print_success(f"Powered off {label} — runtime stops being billed.")
+    steps((_lab_cmd(args, "launch"), "start it again later"))
     return 0
 
 
 def cmd_lab_reset(api: HackSmarterAPI, config: Config, args) -> int:
     fmt = _format_choice(args, config)
-    course_id = resolve_course_id(api, args.identifier)
+    course_id, label = _resolve_lab(api, args)
     if api.lab_kind(course_id) == "aws":
-        return _cmd_lab_aws_action(api, config, args, course_id, "reset")
+        return _cmd_lab_aws_action(api, config, args, course_id, "reset", label)
     course_id, system_id = _resolve_lab_system(api, args)
     data = api.reset_system(course_id, system_id)
     if fmt in ("json", "yaml"):
         print_output(data, fmt); return 0
-    print_success(f"Reset system {system_id} — a new IP will be assigned.")
+    print_success(f"Resetting {label} — it comes back on a new IP.")
     # Follow up with the fresh status so the user sees the new IP without
     # a second command. Reset re-provisions, so the address changes.
     try:
         items = _extract_items(api.get_lab_systems(course_id, [system_id]))
         if items:
-            _render_systems_table(_flatten_lab_items(items), title="Post-reset status")
+            _render_systems_table(_flatten_lab_items(items),
+                                  title="Post-reset status")
             new_ip = _system_ip(items[0])
             if new_ip:
-                console.print(f"[green]→ new IP: {new_ip}[/green]")
+                t = Text("new IP: ")
+                t.append(new_ip, style="bold cyan")
+                print_info(t)
     except Exception as e:
-        console.print(f"[dim]status poll failed: {e}[/dim]")
+        print_warning(f"Couldn't read the post-reset status: {e}")
+    steps((_lab_cmd(args, "status"), "the new IP appears once it's back up"))
     return 0
 
 
@@ -1198,29 +1504,40 @@ def _aws_state(lab: Dict[str, Any]) -> str:
 
 
 def _render_aws_table(labs: List[Dict[str, Any]], title: str = "AWS labs"):
-    t = Table(title=title, show_header=True,
+    """One row per AWS environment. Same column discipline as the machine
+    table: ids only when there's something to tell apart, expiry only when
+    the lab sets one."""
+    show_ids = len(labs) > 1
+    show_expiry = any(lab.get("expires_at") for lab in labs)
+    t = Table(title=title, title_justify="left", show_header=True,
               header_style="bold", border_style="dim")
     t.add_column("#", justify="right", style="dim")
-    t.add_column("Name")
-    t.add_column("ID", style="dim")
+    t.add_column("Environment")
     t.add_column("State")
-    t.add_column("Expires")
-    t.add_column("Limit", justify="right", style="dim")
+    if show_expiry:
+        t.add_column("Time left")
+    if show_ids:
+        t.add_column("ID", style="dim")
     for i, lab in enumerate(labs, 1):
-        expires = str(lab.get("expires_at") or "")
-        left = format_time_left(expires)
-        when = format_datetime(expires) if expires else "—"
-        if left:
-            when = f"{when} ({left})"
-        limit = lab.get("time_limit_minutes")
-        t.add_row(
+        row: List[Any] = [
             str(i),
-            truncate(lab.get("name") or "?", 40),
-            str(lab.get("aws_lab_id") or ""),
+            truncate(lab.get("name") or "?", 36),
             _badge(_aws_state(lab), STATE_STYLE),
-            when,
-            f"{limit}m" if limit else "—",
-        )
+        ]
+        if show_expiry:
+            expires = str(lab.get("expires_at") or "")
+            left = format_time_left(expires)
+            cell = Text(left.replace(" left", "") if left else "—")
+            if left and left != "expired":
+                cell.stylize("green" if "h" in left else "yellow")
+            elif left == "expired":
+                cell.stylize("red")
+            if expires:
+                cell.append(f"  (until {format_datetime(expires)})", style="dim")
+            row.append(cell)
+        if show_ids:
+            row.append(str(lab.get("aws_lab_id") or "—"))
+        t.add_row(*row)
     console.print(t)
 
 
@@ -1248,10 +1565,10 @@ def _render_aws_creds(lab: Dict[str, Any]) -> bool:
     if not isinstance(outputs, dict) or not outputs:
         return False
     t = Table(show_header=False, border_style="dim", box=None, padding=(0, 2))
-    t.add_column("key", style="cyan")
-    t.add_column("value")
+    t.add_column("key", style="dim")
+    t.add_column("value", style="bold cyan")
     for k, v in outputs.items():
-        t.add_row(str(k), str(v) if not isinstance(v, (dict, list)) else str(v))
+        t.add_row(str(k).replace("_", " "), str(v))
     expires = str(lab.get("expires_at") or "")
     left = format_time_left(expires)
     title = f"Credentials — {lab.get('name') or lab.get('aws_lab_id')}"
@@ -1328,85 +1645,102 @@ def _aws_inputs(lab: Dict[str, Any], args) -> Dict[str, str]:
 
 
 def _cmd_lab_launch_aws(api: HackSmarterAPI, config: Config, args,
-                        course_id: str) -> int:
+                        course_id: str, lab_label: str = "") -> int:
     import time
     fmt = _format_choice(args, config)
     lab = _resolve_aws_lab(api, course_id, getattr(args, "system", None))
     lab_id = lab["aws_lab_id"]
-    label = lab.get("name") or lab_id
+    label = lab.get("name") or lab_label or lab_id
 
     if _aws_state(lab) in AWS_READY_STATES:
-        print_info(f"{label} is already running.")
         if fmt in ("json", "yaml"):
             print_output(lab, fmt)
             return 0
+        print_info(f"{label} is already up.")
         _render_aws_creds(lab)
-        print_info("Use `reset` for a fresh environment, `extend` for more time.")
+        steps((_lab_cmd(args, "creds --export"), "load the keys into your shell"),
+              (_lab_cmd(args, "extend"), "buy more time"),
+              (_lab_cmd(args, "reset"), "start over with fresh keys"))
         return 0
 
     inputs = _aws_inputs(lab, args)
     if inputs.get("allowed_ip"):
-        print_info(f"allowed_ip: {inputs['allowed_ip']}"
-                   + ("" if getattr(args, "allowed_ip", None)
-                      else "  (server-suggested — override with --allowed-ip)"))
+        note = ("" if getattr(args, "allowed_ip", None)
+                else "  (as HackSmarter sees you — override with --allowed-ip)")
+        print_info(f"Locking the lab to {inputs['allowed_ip']}{note}")
 
     data = api.aws_lab_power(course_id, lab_id, "start", inputs)
     if not args.wait:
         if fmt in ("json", "yaml"):
             print_output(data, fmt)
             return 0
-        print_success(f"Start requested for {label}")
-        print_info(f"Terraform takes a couple of minutes. Poll with "
-                   f"`hsmcli lab {args.identifier} status`.")
+        print_success(f"Building {label}")
+        print_info("Terraform takes a couple of minutes.")
+        steps((_lab_cmd(args, "status"), "check whether it's ready"))
         return 0
 
-    print_success(f"Start requested for {label}")
-    deadline = time.monotonic() + args.timeout
+    print_success(f"Building {label}")
+    started = time.monotonic()
+    deadline = started + args.timeout
     last_state = _aws_state(lab)
     console.print()
-    console.print(f"[dim]Waiting for terraform to apply (timeout {args.timeout}s)…[/dim]")
 
-    while time.monotonic() < deadline:
-        try:
-            lab = {**api.get_aws_lab(course_id, lab_id), "aws_lab_id": lab_id}
-            state = _aws_state(lab)
-        except Exception as e:
-            lab = {"aws_lab_id": lab_id, "state": "unknown", "error_message": str(e)}
-            state = "poll-error"
+    with console.status("", spinner="dots") as spinner:
+        while time.monotonic() < deadline:
+            try:
+                lab = {**api.get_aws_lab(course_id, lab_id), "aws_lab_id": lab_id}
+                state = _aws_state(lab)
+            except Exception as e:
+                lab = {"aws_lab_id": lab_id, "state": "unknown",
+                       "error_message": str(e)}
+                state = "unreadable"
 
-        if state != last_state:
-            console.print(f"  [dim]{time.strftime('%H:%M:%S')}[/dim]  ", end="")
-            console.print(_badge(state, STATE_STYLE))
-            last_state = state
+            if state != last_state:
+                line = Text(f"  {time.strftime('%H:%M:%S')}  ", style="dim")
+                line.append(_badge(state, STATE_STYLE))
+                console.print(line)
+                last_state = state
 
-        if state in AWS_READY_STATES:
-            if fmt in ("json", "yaml"):
-                print_output(lab, fmt)
-                return 0
-            console.print(f"[green]✓ {label} is ready.[/green]")
-            if not _render_aws_creds(lab):
-                print_warning("Lab is ready but returned no terraform outputs.")
+            if state in AWS_READY_STATES or state in AWS_FAILED_STATES:
+                break
+
+            spinner.update(status=Text(
+                f"  terraform is applying — {human_duration(time.monotonic() - started)}"
+                f" elapsed", style="dim"))
+            time.sleep(5)
+
+    took = human_duration(time.monotonic() - started)
+    if last_state in AWS_READY_STATES:
+        if fmt in ("json", "yaml"):
+            print_output(lab, fmt)
             return 0
-        if state in AWS_FAILED_STATES:
-            console.print(f"[red]✗ start failed: {state}[/red]")
-            if lab.get("error_message"):
-                print_error(str(lab["error_message"]))
-            return 1
+        print_success(f"{label} is ready  ({took})")
+        if not _render_aws_creds(lab):
+            print_warning("It's ready, but HackSmarter returned no credentials.")
+        steps((_lab_cmd(args, "creds --export"),
+               "eval this to load the keys into your shell"))
+        return 0
+    if last_state in AWS_FAILED_STATES:
+        print_error(f"{label} failed to build ({human_state(last_state)}).")
+        if lab.get("error_message"):
+            print_warning(str(lab["error_message"]))
+        steps((_lab_cmd(args, "launch"), "try again"), to_stderr=True)
+        return 1
 
-        time.sleep(5)
-
-    print_warning(f"timeout after {args.timeout}s — last state: {last_state}")
-    print_info(f"It may still finish. Poll with `hsmcli lab {args.identifier} status`.")
+    print_warning(f"Still {human_state(last_state)} after {took} — giving up on "
+                  f"the wait, not on the lab.")
+    steps((_lab_cmd(args, "status"), "check again in a minute"))
     return 2
 
 
 def _cmd_lab_aws_action(api: HackSmarterAPI, config: Config, args,
-                        course_id: str, action: str) -> int:
+                        course_id: str, action: str,
+                        lab_label: str = "") -> int:
     """stop / reset / extend for an AWS lab, then show the fresh status."""
     fmt = _format_choice(args, config)
     lab = _resolve_aws_lab(api, course_id, getattr(args, "system", None))
     lab_id = lab["aws_lab_id"]
-    label = lab.get("name") or lab_id
+    label = lab.get("name") or lab_label or lab_id
 
     # `reset` tears the environment down and re-applies, so it needs the
     # same inputs `start` did; stop/extend don't take any.
@@ -1416,28 +1750,34 @@ def _cmd_lab_aws_action(api: HackSmarterAPI, config: Config, args,
         print_output(data, fmt)
         return 0
 
-    verb = {"stop": "Stopped", "reset": "Reset", "extend": "Extended"}[action]
-    print_success(f"{verb} AWS lab {label}")
+    print_success({
+        "stop": f"Tearing down {label} — the keys stop working.",
+        "reset": f"Rebuilding {label} from scratch.",
+        "extend": f"Extended {label}'s time limit.",
+    }[action])
     try:
         fresh = {**api.get_aws_lab(course_id, lab_id), "aws_lab_id": lab_id}
     except Exception as e:
-        console.print(f"[dim]status poll failed: {e}[/dim]")
+        print_warning(f"Couldn't read the new status: {e}")
         return 0
     _render_aws_table([fresh], title="Status")
     if action in ("reset", "extend"):
         _render_aws_creds(fresh)
     if action == "reset":
-        print_info(f"Re-provisioning takes a couple of minutes — poll with "
-                   f"`hsmcli lab {args.identifier} status`.")
+        print_info("Terraform takes a couple of minutes to re-apply.")
+        steps((_lab_cmd(args, "creds"), "the new keys land here"))
     return 0
 
 
 def cmd_lab_creds(api: HackSmarterAPI, config: Config, args) -> int:
     """Print an AWS lab's IAM credentials (terraform outputs)."""
     fmt = _format_choice(args, config)
-    course_id = resolve_course_id(api, args.identifier)
+    course_id, label = _resolve_lab(api, args)
     if api.lab_kind(course_id) != "aws":
-        print_error("This lab isn't an AWS lab — try `systems` / `vpn` instead.")
+        print_error(f"{label} is a machine lab — it has no IAM keys.")
+        steps((_lab_cmd(args, "status"), "the IP is what you want"),
+              (_lab_cmd(args, "vpn"), "get on its network"),
+              to_stderr=True)
         return 2
     lab = _resolve_aws_lab(api, course_id, args.system)
     outputs = lab.get("terraform_outputs") or {}
@@ -1446,8 +1786,9 @@ def cmd_lab_creds(api: HackSmarterAPI, config: Config, args) -> int:
         # stdout must stay eval-able: warnings go to stderr, nothing else
         # is printed.
         if not outputs:
-            print_error(f"No credentials — lab state is '{_aws_state(lab)}'. "
-                        f"Launch it first.")
+            print_error(f"No credentials yet — {label} is "
+                        f"{human_state(_aws_state(lab))}.")
+            steps((_lab_cmd(args, "launch"), "build it first"), to_stderr=True)
             return 1
         for line in _aws_env_exports(outputs):
             print(line)
@@ -1456,53 +1797,60 @@ def cmd_lab_creds(api: HackSmarterAPI, config: Config, args) -> int:
         print_output(outputs or lab, fmt)
         return 0
     if not _render_aws_creds(lab):
-        print_warning(f"No credentials yet — lab state is '{_aws_state(lab)}'. "
-                      f"Run `hsmcli lab {args.identifier} launch`.")
+        print_warning(f"No credentials yet — {label} is "
+                      f"{human_state(_aws_state(lab))}.")
+        steps((_lab_cmd(args, "launch"), "build it first"))
         return 1
+    steps((f'eval "$({_lab_cmd(args, "creds --export")})"',
+           "load these into your shell for the aws CLI"))
     return 0
 
 
 def cmd_lab_extend(api: HackSmarterAPI, config: Config, args) -> int:
-    course_id = resolve_course_id(api, args.identifier)
+    course_id, label = _resolve_lab(api, args)
     if api.lab_kind(course_id) != "aws":
-        print_error("`extend` only applies to AWS labs.")
+        print_error(f"`extend` only applies to AWS labs — {label} isn't one.")
+        steps((_lab_cmd(args, "status"), "check how long it has left"),
+              to_stderr=True)
         return 2
-    return _cmd_lab_aws_action(api, config, args, course_id, "extend")
+    return _cmd_lab_aws_action(api, config, args, course_id, "extend", label)
 
 
-QUESTION_STATE_STYLE = {
-    "correct": "green",
-    "incorrect": "red",
-    "attempted": "yellow",
-    "not_attempted": "dim",
-    "unanswered": "dim",
-}
+def _render_flags_table(items: List[Dict[str, Any]], title: str = "Flags"):
+    """The flags table.
 
-
-def _render_flags_table(items: List[Dict[str, Any]], title: str = "Flags / questions"):
-    t = Table(title=title, show_header=True,
+    Columns earn their place: ``Points`` appears only when the lab actually
+    scores its questions (most don't — every value is ``—``), and the hint
+    marker rides along in the prompt column instead of taking a column of
+    its own. ``match_type`` is dropped entirely: it's ``exact`` on every
+    flag ever seen, and it says nothing you can act on.
+    """
+    scored = any(q.get("points") for q in items)
+    t = Table(title=title, show_header=True, title_justify="left",
               header_style="bold", border_style="dim")
     t.add_column("#", justify="right", style="dim")
-    t.add_column("Prompt")
-    t.add_column("State")
-    t.add_column("Pts", justify="right")
-    t.add_column("Match", style="dim")
-    t.add_column("Hint", justify="center", style="dim")
+    t.add_column("Flag")
+    t.add_column("Status")
+    if scored:
+        t.add_column("Points", justify="right")
     for i, q in enumerate(items, 1):
-        t.add_row(
+        prompt = Text(truncate(q.get("prompt") or "?", 58))
+        if q.get("has_hint"):
+            prompt.append("  (hint available)", style="dim")
+        row: List[Any] = [
             str(i),
-            truncate(q.get("prompt") or "?", 60),
+            prompt,
             _badge(q.get("state") or "not_attempted", QUESTION_STATE_STYLE),
-            str(q.get("points") or "—"),
-            str(q.get("match_type") or "—"),
-            "✓" if q.get("has_hint") else "",
-        )
+        ]
+        if scored:
+            row.append(str(q.get("points") or "—"))
+        t.add_row(*row)
     console.print(t)
 
 
 def cmd_lab_flags(api: HackSmarterAPI, config: Config, args) -> int:
     fmt = _format_choice(args, config)
-    course_id = resolve_course_id(api, args.identifier)
+    course_id, label = _resolve_lab(api, args)
     take = api.get_course_take(course_id)
     questions = api.extract_questions(take)
     if fmt == "json":
@@ -1510,15 +1858,48 @@ def cmd_lab_flags(api: HackSmarterAPI, config: Config, args) -> int:
     if fmt == "yaml":
         print_yaml(questions); return 0
     if not questions:
-        print_warning("No questions/flags in this lab's /take payload.")
+        print_warning(f"{label} has no flags to submit.")
         return 0
-    _render_flags_table(questions)
+    _render_flags_table(questions, title=f"Flags — {label}")
+    console.print()
+
+    solved = [q for q in questions
+              if (q.get("state") or "").lower() == "correct"]
+    summary = f"{len(solved)}/{len(questions)} solved"
     total_pts = sum(int(q.get("points") or 0) for q in questions)
-    got_pts = sum(int(q.get("points") or 0) for q in questions
-                  if (q.get("state") or "").lower() == "correct")
-    print()
-    print_info(f"{got_pts}/{total_pts} points earned across {len(questions)} question(s)")
+    if total_pts:
+        got_pts = sum(int(q.get("points") or 0) for q in solved)
+        summary += f" · {got_pts}/{total_pts} points"
+    print_info(summary)
+
+    unsolved = [q for q in questions if q not in solved]
+    if unsolved:
+        # Suggest the selector the user would actually type: `submit` takes
+        # a prompt substring, and "user"/"root" is how the flags are named.
+        hint = _flag_selector(unsolved[0], questions)
+        steps((_lab_cmd(args, f"submit {hint} '<flag>'"), "submit an answer"))
     return 0
+
+
+def _flag_selector(question: Dict[str, Any],
+                   questions: List[Dict[str, Any]]) -> str:
+    """The shortest thing ``submit`` will accept for this question.
+
+    Prefers the "user"/"root" keyword when it identifies the question
+    uniquely (it does on virtually every challenge lab), and falls back to
+    the 1-based index, which always works.
+    """
+    prompt = (question.get("prompt") or "").lower()
+    for word in ("user", "root", "admin", "flag"):
+        if word not in prompt:
+            continue
+        if sum(1 for q in questions
+               if word in (q.get("prompt") or "").lower()) == 1:
+            return word
+    try:
+        return str(questions.index(question) + 1)
+    except ValueError:
+        return "1"
 
 
 def _match_question(
@@ -1604,7 +1985,7 @@ def _submission_verdict(data: Any) -> Tuple[Optional[bool], Optional[str]]:
 
 def cmd_lab_submit(api: HackSmarterAPI, config: Config, args) -> int:
     fmt = _format_choice(args, config)
-    course_id = resolve_course_id(api, args.identifier)
+    course_id, label = _resolve_lab(api, args)
     take = api.get_course_take(course_id)
     questions = api.extract_questions(take)
     try:
@@ -1612,16 +1993,18 @@ def cmd_lab_submit(api: HackSmarterAPI, config: Config, args) -> int:
     except LookupError as e:
         print_error(str(e))
         if questions:
-            print_info("Available questions:")
-            _render_flags_table(questions)
+            _render_flags_table(questions, title=f"Flags — {label}")
+            steps((_lab_cmd(args, f"submit {_flag_selector(questions[0], questions)} "
+                                  f"'<flag>'"), "pick by keyword, or by number",),
+                  to_stderr=True)
         return 2
 
     if (q.get("state") or "").lower() == "correct" and not args.force:
-        print_warning(
-            f"Question already marked correct "
-            f"(previous submission: {q.get('last_submission')}). "
-            f"Pass --force to resubmit anyway."
-        )
+        print_warning(f"Already solved: {truncate(q.get('prompt') or '?', 50)}")
+        if q.get("last_submission"):
+            print_info(f"You submitted: {q['last_submission']}")
+        steps((f"{_lab_cmd(args, 'submit')} {quote_arg(args.selector)} "
+               f"{quote_arg(args.value)} --force", "submit it again anyway"))
         return 0
 
     data = api.submit_question(
@@ -1635,42 +2018,70 @@ def cmd_lab_submit(api: HackSmarterAPI, config: Config, args) -> int:
         print_output(data, fmt); return 0
 
     correct, answer = _submission_verdict(data)
-    prompt_short = truncate(q.get("prompt") or "?", 60)
+    prompt_short = truncate(q.get("prompt") or "?", 56)
     if correct is None:
         # Never report an unparsed reply as a wrong flag — show it instead.
-        print_warning(f"unrecognised server reply — {prompt_short}")
+        print_warning(f"HackSmarter's reply didn't say whether that was right "
+                      f"— {prompt_short}")
         print_json(data)
         return 1
     if correct:
-        print_success(f"correct — {prompt_short}  ({q.get('points') or '?'} pts)")
+        pts = q.get("points")
+        print_success(f"Correct — {prompt_short}"
+                      + (f"  (+{pts} points)" if pts else ""))
         # The server echoes its own canonical casing; only worth showing when
         # it differs by more than case/whitespace.
         if answer and answer.strip().lower() != (args.value or "").strip().lower():
-            print_info(f"server-accepted answer: {answer}")
+            print_info(f"Recorded as: {answer}")
+        # Where that leaves the lab: the remaining flag, or the finish line.
+        remaining = [x for x in questions
+                     if x is not q and (x.get("state") or "").lower() != "correct"]
+        if remaining:
+            print_info(f"{len(questions) - len(remaining)}/{len(questions)} solved")
+            steps((_lab_cmd(args, f"submit {_flag_selector(remaining[0], questions)} "
+                                  f"'<flag>'"), "next one"))
+        else:
+            print_success(f"{label} complete — every flag submitted.")
+            steps((_lab_cmd(args, "stop"), "power the machine off"))
     else:
-        print_error(f"incorrect — {prompt_short}")
+        print_error(f"Not the flag — {prompt_short}")
         # Server sometimes echoes hints or attempt counters, flat or nested.
+        labels = {"hint": "Hint", "attempts_remaining": "Attempts left",
+                  "message": "Server says"}
         result = data.get("result") if isinstance(data, dict) else None
+        seen = set()
         for scope in (data, result):
             if not isinstance(scope, dict):
                 continue
-            for k in ("hint", "attempts_remaining", "message"):
+            for k, human in labels.items():
                 v = scope.get(k)
-                if v:
-                    print_info(f"  {k}: {v}")
+                if v and k not in seen:
+                    seen.add(k)
+                    print_info(f"{human}: {v}")
     return 0 if correct else 1
 
 
+def _vpn_filename(label: str) -> str:
+    """``dark.ovpn`` for a lab called "Challenge Lab: Dark (Easy)"."""
+    return f"{slugify(label, fallback='hsm-lab')}.ovpn"
+
+
 def cmd_lab_vpn(api: HackSmarterAPI, config: Config, args) -> int:
-    course_id = resolve_course_id(api, args.identifier)
+    course_id, label = _resolve_lab(api, args)
     dest = args.output
     if not dest:
-        # Default to ./<course_id>.ovpn in cwd — matches htbcli behavior.
-        dest = f"hsm-{course_id}.ovpn"
+        # Named after the lab, not its UUID: this file gets passed to
+        # openvpn by hand, sits in a working directory next to the notes,
+        # and `hsm-bb164cba-ddc9-4cb0-8e95-ad4853d0143c.ovpn` is unusable
+        # for either.
+        dest = _vpn_filename(label)
     text = api.get_vpn_config(course_id, dest_path=dest)
-    print_success(f"VPN config written to {dest} ({len(text)} bytes)")
+    print_success(f"VPN profile for {label} → {dest}")
     if args.print:
         print(text)
+    else:
+        steps((f"sudo openvpn {dest}", "connect (keep it running)"),
+              (_lab_cmd(args, "status"), "check the machine is up"))
     return 0
 
 
@@ -1687,20 +2098,21 @@ def _guess_image_ext(data: bytes) -> str:
 
 
 def cmd_lab_image(api: HackSmarterAPI, config: Config, args) -> int:
-    course_id = resolve_course_id(api, args.identifier)
+    course_id, label = _resolve_lab(api, args)
     body = _unwrap_course(api.get_course(course_id))
     image_path = body.get("image_path")
     if not image_path:
-        print_warning("This lab has no image_path set.")
+        print_warning(f"{label} has no thumbnail.")
         return 0
     if args.url_only:
         print(api.image_url(image_path))
         return 0
     data = api.download_lab_image(image_path)
-    dest = args.output or f"hsm-{course_id}{_guess_image_ext(data)}"
+    dest = args.output or f"{slugify(label, fallback=f'hsm-{course_id}')}" \
+                          f"{_guess_image_ext(data)}"
     with open(dest, "wb") as f:
         f.write(data)
-    print_success(f"Image written to {dest} ({len(data)} bytes)")
+    print_success(f"Thumbnail for {label} → {dest} ({len(data):,} bytes)")
     return 0
 
 
@@ -1719,10 +2131,185 @@ def _need_subcommand(command: str, actions) -> int:
     return 2
 
 
-def _simple_get(api_fn, args, config: Config) -> int:
+# ── errors, in plain language ─────────────────────────────────────────────
+#
+# Everything below turns an exception into something a person can act on.
+# The exception's own message stays technical (endpoint, status, body) for
+# --debug and bug reports; what gets printed is the reason plus the command
+# that fixes it.
+
+def _explain_error(exc: Exception, args) -> int:
+    """Print ``exc`` the way a person needs it, and return the exit code.
+
+    Everything here goes to stderr — the message and its follow-up
+    commands are one unit, and splitting them across streams means
+    `hsmcli … > out.txt` shows you a bare ✗ with the fix in the file.
+
+    Exit codes are unchanged from the typed-error release: 2 for "you asked
+    for something that doesn't exist / isn't allowed yet", 1 for "it broke".
+    """
+    identifier = getattr(args, "identifier", None)
+    lab = quote_arg(identifier) if identifier else "<lab>"
+    detail = exc.server_message() if isinstance(exc, HttpError) else ""
+
+    if isinstance(exc, AuthError):
+        print_error("HackSmarter rejected your session — the cookie is "
+                    "missing or expired.")
+        steps(("hsmcli config set-cookie '<paste Cookie header>'",
+               "devtools → Network → any request → Cookie"),
+              ("hsmcli whoami", "check it worked"),
+              header="Log in again at https://www.hacksmarter.org, then:",
+              to_stderr=True)
+        return 1
+
+    if isinstance(exc, (ForbiddenError, NotEnrolledError)):
+        # A 403 here is almost never a permissions problem: owned and free
+        # labs still need an explicit enroll before the API will serve
+        # their flags, machines or VPN.
+        print_error(f"You're not enrolled in {lab}, so HackSmarter won't "
+                    f"share it yet.")
+        if detail:
+            info_err(detail)
+        steps((f"hsmcli lab {lab} enroll", "free, and takes a second"),
+              to_stderr=True)
+        return 2
+
+    if isinstance(exc, TransportError):
+        print_error("Couldn't reach hacksmarter.org.")
+        steps(("hsmcli whoami", "try again once you're back online"),
+              header="Check your connection — a lab VPN that's up but not "
+                     "routing will do this too.",
+              to_stderr=True)
+        return 1
+
+    if isinstance(exc, HttpError):
+        status = exc.status
+        if status == 404:
+            print_error("HackSmarter has no record of that.")
+            if exc.endpoint:
+                info_err(exc.endpoint)
+            steps(("hsmcli labs list", "what your account can actually see"),
+                  to_stderr=True)
+            return 2
+        if status == 429:
+            print_error("Rate-limited by HackSmarter — too many requests.")
+            info_err("Give it a minute, then try again.")
+            return 1
+        if status and status >= 500:
+            print_error(f"HackSmarter's API is having trouble (HTTP {status}).")
+            if detail:
+                info_err(detail)
+            info_err("That's their side, not yours — try again shortly.")
+            return 1
+        # 400 and friends: the server usually says exactly what it disliked
+        # ("System is already running"), and that beats anything we'd write.
+        print_error(detail or f"HackSmarter rejected that request "
+                              f"(HTTP {status or '?'}).")
+        if not getattr(args, "debug", False):
+            info_err("Re-run with --debug to see the request and reply.")
+        return 1
+
+    print_error(str(exc) or exc.__class__.__name__)
+    if not getattr(args, "debug", False):
+        info_err("Re-run with --debug to see the request and reply.")
+    return 1
+
+
+def _welcome(config: Config) -> int:
+    """The no-arguments screen: what this is, and the first thing to do."""
+    signed_in = bool(config.get_cookie())
+    console.print()
+    console.print(Panel(
+        Text.assemble(
+            ("HackSmarter from the terminal", "bold white"),
+            ("\nBrowse labs, start and stop machines, pull the VPN profile, "
+             "submit flags.", ""),
+        ),
+        title=f"hsmcli {client_version()}", title_align="left",
+        border_style="cyan", padding=(0, 2),
+    ))
+    # Someone who has already pasted a cookie doesn't need step 1 — the
+    # welcome screen is also what `hsmcli` alone prints on the hundredth run.
+    steps(
+        ("hsmcli config set-cookie '<cookie>'", "1 · sign in") if not signed_in else None,
+        ("hsmcli labs list", "find a lab"),
+        ("hsmcli lab <name> launch", "start it"),
+        ("hsmcli lab <name> vpn", "get on the lab network"),
+        ("hsmcli lab <name> submit user '<flag>'", "submit a flag"),
+        ("hsmcli --help", "everything else"),
+    )
+    return 0
+
+
+# Keys worth a column in the generic list view, in the order they should
+# appear. These endpoints (notifications, events, orgs, bundles, exams) each
+# return their own shape, and none is important enough to hand-write a
+# renderer for — but a wall of raw JSON isn't a listing either.
+_GENERIC_COLUMNS = (
+    "name", "title", "subject", "message", "description",
+    "state", "status", "type", "kind",
+    "created_at", "starts_at", "start_date", "expires_at", "read_at",
+)
+
+_GENERIC_LABELS = {
+    "created_at": "created", "starts_at": "starts", "start_date": "starts",
+    "expires_at": "expires", "read_at": "read",
+}
+
+
+def _render_generic_table(items: List[Dict[str, Any]], title: str) -> bool:
+    """Table any list-of-records payload; ``False`` if it can't be tabled.
+
+    Picks the columns from the records themselves: a key earns a column by
+    appearing on at least one record with a scalar value. Anything left
+    over is still reachable with ``--json``, which the footer says.
+    """
+    if not items or not all(isinstance(it, dict) for it in items):
+        return False
+    cols = [k for k in _GENERIC_COLUMNS
+            if any(isinstance(it.get(k), (str, int, float, bool))
+                   and it.get(k) not in ("", None)
+                   for it in items)]
+    if not cols:
+        return False
+
+    t = Table(title=title, title_justify="left", show_header=True,
+              header_style="bold", border_style="dim")
+    t.add_column("#", justify="right", style="dim")
+    for c in cols:
+        t.add_column(_GENERIC_LABELS.get(c, c.replace("_", " ")))
+    for i, it in enumerate(items, 1):
+        row = [str(i)]
+        for c in cols:
+            v = it.get(c)
+            if c.endswith(("_at", "_date")) and isinstance(v, str):
+                row.append(format_datetime(v) or "—")
+            elif c in ("state", "status", "type", "kind") and v:
+                row.append(_badge(v, STATE_STYLE, default="white"))
+            else:
+                row.append(truncate(v, 44) if v not in ("", None) else "—")
+        t.add_row(*row)
+    console.print(t)
+    return True
+
+
+def _simple_get(api_fn, args, config: Config, label: str = "") -> int:
     fmt = _format_choice(args, config)
     data = api_fn()
-    print_output(data, fmt)
+    if fmt in ("json", "yaml"):
+        print_output(data, fmt)
+        return 0
+    items = _extract_items(data)
+    plural = f"{label}s" if label else "results"
+    if not items:
+        print_info(f"No {plural}.")
+        return 0
+    if not _render_generic_table(items, plural.capitalize()):
+        print_json(data)
+        return 0
+    console.print()
+    print_info(f"{len(items)} {label if len(items) == 1 else plural}"
+               f" · --json for every field")
     return 0
 
 
@@ -1737,12 +2324,19 @@ def _add_format_flags(p):
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="hsmcli",
-        description="HackSmarter CLI — manage labs, systems, and VPN from the terminal.",
+        description="HackSmarter from the terminal — browse labs, start and "
+                    "stop machines, pull the VPN profile, submit flags.",
+        epilog="Labs are named, not numbered: `hsmcli lab dark launch` works "
+               "as well as the UUID. Start with `hsmcli labs list`.",
     )
+    p.add_argument("--version", action="version",
+                   version=f"hsmcli {client_version()}")
     p.add_argument("--debug", action="store_true",
                    help="trace every API request/response to stderr")
+    p.add_argument("--no-color", action="store_true",
+                   help="plain output, no ANSI colour (NO_COLOR works too)")
     p.add_argument("--config-dir", help="override config directory (default ~/.hsmcli)")
-    sp = p.add_subparsers(dest="command")
+    sp = p.add_subparsers(dest="command", metavar="COMMAND")
 
     # config
     pc = sp.add_parser("config", help="manage configuration")
@@ -1912,8 +2506,21 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    try:
+        return _run()
+    except KeyboardInterrupt:
+        # Ctrl-C during a launch poll is normal — the machine keeps booting.
+        # A traceback here reads as a crash and buries that.
+        console.print()
+        print_warning("Interrupted. Anything already started keeps running.")
+        return 130
+
+
+def _run() -> int:
     parser = build_parser()
     args = parser.parse_args()
+    if getattr(args, "no_color", False):
+        disable_color()
     try:
         config = Config(getattr(args, "config_dir", None))
     except (ValueError, OSError) as e:
@@ -1921,8 +2528,7 @@ def main() -> int:
         return 1
 
     if not args.command:
-        parser.print_help()
-        return 0
+        return _welcome(config)
 
     # Config subcommands don't need an authenticated API client.
     if args.command == "config":
@@ -1940,14 +2546,23 @@ def main() -> int:
         try:
             return fn(config, args)
         except Exception as e:
-            print_error(str(e))
-            return 1
+            return _explain_error(e, args)
 
-    # Everything else needs the API client.
+    # Everything else needs a session. Saying so up front beats letting the
+    # first API call come back 401 and reporting it as an auth failure —
+    # there's nothing to fail yet if you've never signed in.
+    if not config.get_cookie():
+        print_error("You're not signed in yet.")
+        steps(("hsmcli config set-cookie '<paste Cookie header>'",
+               "devtools → Network → any request → Cookie"),
+              header="Log in at https://www.hacksmarter.org, then:",
+              to_stderr=True)
+        return 1
+
     try:
         api = HackSmarterAPI(config, debug=args.debug)
     except Exception as e:
-        print_error(f"Failed to init API client: {e}")
+        print_error(f"Couldn't set up the API client: {e}")
         return 1
 
     try:
@@ -1979,17 +2594,17 @@ def main() -> int:
                 return _need_subcommand("lab <identifier>", table)
             return fn(api, config, args)
         if args.command == "notifications":
-            return _simple_get(api.get_notifications, args, config)
+            return _simple_get(api.get_notifications, args, config, "notification")
         if args.command == "events":
-            return _simple_get(api.get_events, args, config)
+            return _simple_get(api.get_events, args, config, "event")
         if args.command == "subscriptions":
-            return _simple_get(api.get_subscriptions, args, config)
+            return _simple_get(api.get_subscriptions, args, config, "subscription")
         if args.command == "orgs":
-            return _simple_get(api.get_orgs, args, config)
+            return _simple_get(api.get_orgs, args, config, "organization")
         if args.command == "bundles":
-            return _simple_get(api.get_bundles, args, config)
+            return _simple_get(api.get_bundles, args, config, "bundle")
         if args.command == "exams":
-            return _simple_get(api.get_owned_exams, args, config)
+            return _simple_get(api.get_owned_exams, args, config, "exam")
         if args.command == "heartbeat":
             fmt = _format_choice(args, config)
             if getattr(args, "identifier", None):
@@ -2024,7 +2639,10 @@ def main() -> int:
             except Exception:
                 pass
             if not customer_id:
-                print_error("Couldn't determine customer_id from any enrolled course.")
+                print_error("Couldn't work out which account to bill — none "
+                            "of your enrolled labs names a customer.")
+                steps(("hsmcli lab <name> enroll", "enroll in one lab first"),
+                      to_stderr=True)
                 return 1
 
             payg = api.get_credits(customer_id)
@@ -2035,25 +2653,34 @@ def main() -> int:
                 return 0
 
             # PAYG top-up (usually empty for subscription users)
-            header = Text()
-            header.append("Pay-as-you-go top-up credits", style="bold")
+            body = Text()
             if isinstance(payg_body, dict):
                 for k, v in payg_body.items():
                     if isinstance(v, (dict, list)):
                         continue
-                    header.append(f"\n  {k:<28} ")
-                    header.append(str(v), style="cyan")
-            console.print(Panel(header, border_style="cyan", padding=(0, 2)))
-            console.print("[dim]This is the top-up balance. Your subscription's monthly "
-                          "runtime allowance is shown per-lab (see `hsmcli lab <name> info` "
-                          "→ runtime).[/dim]")
+                    if body:
+                        body.append("\n")
+                    body.append(f"{str(k).replace('_', ' '):<26}", style="dim")
+                    body.append(str(v), style="cyan")
+            if not body:
+                body.append("nothing on top-up", style="dim")
+            console.print(Panel(body, title="Pay-as-you-go credits",
+                                title_align="left",
+                                border_style="cyan", padding=(0, 2)))
+            print_info("This is the top-up balance only. A subscription's "
+                       "monthly runtime allowance shows per-lab, in "
+                       "`hsmcli lab <name> info`.")
             return 0
     except LookupError as e:
+        # Name resolution: "no lab matching 'drak'", "ambiguous 'nova' — …".
+        # Already written for a person; don't wrap it.
         print_error(str(e))
+        if getattr(args, "identifier", None):
+            steps(("hsmcli labs list", "see the names your account can use"),
+                  to_stderr=True)
         return 2
     except Exception as e:
-        print_error(str(e))
-        return 1
+        return _explain_error(e, args)
 
     parser.print_help()
     return 0

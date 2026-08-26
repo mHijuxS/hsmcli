@@ -1,12 +1,26 @@
-"""Terminal output helpers."""
+"""Value formatters and output dispatch.
+
+The one-line status messages below are thin aliases for :mod:`hsmcli.ui`,
+which owns styling — they predate that module and are kept because they
+read well at the call site.
+"""
 
 import json as _json
-import sys
 from datetime import datetime, timezone
 from typing import Any, List
 
+from . import ui
+from .ui import console
+
 
 class Colors:
+    """Raw SGR codes, kept for anything embedding colour in a plain string.
+
+    New code should print through :mod:`hsmcli.ui` instead: rich drops the
+    escapes automatically when the output isn't a terminal, or when
+    ``NO_COLOR`` / ``--no-color`` is set.
+    """
+
     RED = "\033[91m"
     GREEN = "\033[92m"
     YELLOW = "\033[93m"
@@ -20,19 +34,19 @@ class Colors:
 
 
 def print_success(msg: str):
-    print(f"{Colors.GREEN}✓ {msg}{Colors.END}")
+    ui.ok(msg)
 
 
 def print_error(msg: str):
-    print(f"{Colors.RED}✗ {msg}{Colors.END}", file=sys.stderr)
+    ui.fail(msg)
 
 
 def print_info(msg: str):
-    print(f"{Colors.BLUE}ℹ {msg}{Colors.END}")
+    ui.info(msg)
 
 
 def print_warning(msg: str):
-    print(f"{Colors.YELLOW}⚠ {msg}{Colors.END}")
+    ui.warn(msg)
 
 
 def print_json(data: Any, indent: int = 2):
@@ -48,21 +62,18 @@ def print_yaml(data: Any):
         print_json(data)
 
 
-def print_table(headers: List[str], rows: List[List[Any]], max_width: int = 0):
+def print_table(headers: List[str], rows: List[List[Any]]):
+    """Plain-text table. Kept for library callers; the CLI renders its own
+    tables with rich (see ``cli._render_*_table``)."""
     if not headers:
         return
-    rows = [[("" if c is None else str(c)) for c in r] for r in rows]
-    widths = [len(h) for h in headers]
+    from rich.table import Table
+    t = Table(show_header=True, header_style="bold", border_style="dim")
+    for h in headers:
+        t.add_column(str(h))
     for r in rows:
-        for i, c in enumerate(r):
-            if i < len(widths):
-                widths[i] = max(widths[i], len(c))
-    header = " | ".join(h.ljust(widths[i]) for i, h in enumerate(headers))
-    print(f"{Colors.BOLD}{header}{Colors.END}")
-    print("-+-".join("-" * w for w in widths))
-    for r in rows:
-        cells = [(r[i] if i < len(r) else "").ljust(widths[i]) for i in range(len(headers))]
-        print(" | ".join(cells))
+        t.add_row(*[("" if c is None else str(c)) for c in r])
+    console.print(t)
 
 
 def format_datetime(dt: str) -> str:
@@ -95,17 +106,6 @@ def format_time_left(dt: str) -> str:
         return "expired"
     hours, mins = divmod(secs // 60, 60)
     return f"{hours}h{mins:02d}m left" if hours else f"{mins}m left"
-
-
-def format_difficulty(diff: str) -> str:
-    d = (diff or "").lower()
-    if d in ("easy", "beginner"):
-        return f"{Colors.GREEN}{diff}{Colors.END}"
-    if d in ("medium", "intermediate"):
-        return f"{Colors.YELLOW}{diff}{Colors.END}"
-    if d in ("hard", "advanced", "expert", "insane"):
-        return f"{Colors.RED}{diff}{Colors.END}"
-    return diff or "Unknown"
 
 
 def truncate(text: Any, n: int = 50) -> str:
