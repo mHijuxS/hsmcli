@@ -228,6 +228,62 @@ def resolve_course_id(api, identifier: str) -> str:
     return cid
 
 
+def catalog_item_id(item: Optional[Dict[str, Any]]) -> Optional[str]:
+    """The id ``/api/student/catalog/{id}/buy`` takes, or ``None``.
+
+    Enrolling goes through the catalog, and the catalog keys labs by a
+    *card* id rather than the course id every other endpoint uses:
+    ``/courses`` entries carry it as ``catalog_item_id``; ``/catalog``
+    entries *are* the card, so it's their top-level ``id`` (the course id
+    is the nested ``item.id``).
+    """
+    if not isinstance(item, dict):
+        return None
+    v = item.get("catalog_item_id")
+    if isinstance(v, str) and v:
+        return v
+    nested = item.get("item")
+    if isinstance(nested, dict) and nested.get("id"):
+        v = item.get("id")
+        if isinstance(v, str) and v:
+            return v
+    return None
+
+
+def free_purchase_option_id(item: Optional[Dict[str, Any]]) -> Optional[str]:
+    """The id of a lab's *free* purchase option, or ``None``.
+
+    Some labs — the free challenge labs like Mapper — refuse a null
+    ``purchase_option_id`` with "A purchase option must be selected": you
+    have to name the option even when it costs nothing. Catalog cards carry
+    the choices under ``purchase_options[]`` as ``{"id", "type"}``; this
+    picks the ``"free"`` one. ``None`` means there's no free option to pick
+    (a paid-only lab, or a card that didn't list any), in which case enroll
+    falls back to the null-option request that subscription-covered labs
+    accept.
+    """
+    if not isinstance(item, dict):
+        return None
+    for opt in (item.get("purchase_options") or []):
+        if isinstance(opt, dict) and opt.get("type") == "free" and opt.get("id"):
+            return str(opt["id"])
+    return None
+
+
+def resolve_course_item(
+    api, identifier: str
+) -> Tuple[str, str, Optional[Dict[str, Any]]]:
+    """``(course_id, name, matched item)`` — same resolution as
+    :func:`resolve_course`, handing back the whole item for callers that
+    need a field off it (``enroll`` needs its ``catalog_item_id``).
+
+    Unlike :func:`resolve_course` a bare UUID is *not* a shortcut here: we
+    still list, because the id the caller wants may not be the one typed.
+    """
+    cid, item = resolve_from_list(identifier, all_lab_items(api))
+    return cid, (_item_name(item) if item else ""), item
+
+
 def resolve_course(api, identifier: str) -> Tuple[str, str]:
     """``(course_id, lab name)`` — the name is ``""`` for a bare UUID.
 

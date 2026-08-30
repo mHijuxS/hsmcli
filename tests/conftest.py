@@ -47,8 +47,13 @@ CATALOG_EVENT = {
 # The complete set. Flat: `name` and a top-level `state` that collapses
 # ownership and progress into one field.
 
-def enrolled(name, state, cid):
+def enrolled(name, state, cid, catalog_item_id=None):
+    """One /courses entry. ``catalog_item_id`` is the storefront card this
+    lab is sold as — the id ``enroll`` posts to — and it is *not* the course
+    id; the fixtures mirror that by deriving it from the same suffix."""
     return {"id": cid, "name": name, "content_type": "course", "state": state,
+            "catalog_item_id": catalog_item_id or cid.replace("cccccccc",
+                                                              "aaaaaaaa"),
             "description": f"{name} blurb"}
 
 

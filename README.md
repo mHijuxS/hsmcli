@@ -69,7 +69,7 @@ hsmcli lab <name> info --writeups       # + community walkthrough links (hidden 
 hsmcli lab <name> info --bundles        # + the subscription bundles this lab is in
 hsmcli lab <name> info --all            # every optional section
 hsmcli lab <name> take                  # raw /take payload
-hsmcli lab <name> enroll                # POST /enroll
+hsmcli lab <name> enroll                # claim it (free / covered by your plan)
 hsmcli lab <name> systems               # live status of all systems
 hsmcli lab <name> status                # compact "is it on?" summary
 
@@ -81,6 +81,12 @@ hsmcli lab <name> reset                 # /reset (new IP assigned)
 hsmcli lab <name> vpn                   # download OpenVPN config to ./<lab>.ovpn
 hsmcli lab <name> vpn -o me.ovpn        # …or wherever you want it
 hsmcli lab <name> image                 # download the lab thumbnail (--url-only to just print the URL)
+
+# Finishing a lab
+hsmcli lab <name> complete              # mark its lessons complete (in progress → done)
+hsmcli lab <name> certificate           # download the completion PDF to ./<lab>-certificate.pdf
+hsmcli lab <name> cert -o me.pdf        # …or wherever you want it (alias: cert)
+hsmcli lab <name> certificate --url-only  # print the one-hour signed download URL instead
 
 # AWS labs (Second, Beanstalk, Rotation, …) — same verbs, IAM keys instead of an IP
 hsmcli lab <name> launch                # start + poll until ready, then print credentials
@@ -196,7 +202,7 @@ The two endpoints also disagree on state vocabulary — `/courses` says
 | `labs list --catalog` | GET | `/api/student/catalog` | — |
 | `lab info` | GET | `/api/student/courses/{id}` + `/take` (flags, briefing) | — |
 | `lab take` | GET | `/api/student/courses/{id}/take` | — |
-| `lab enroll` | POST | `/api/student/courses/{id}/enroll` | — |
+| `lab enroll` | POST | `/api/student/catalog/{catalog_item_id}/buy` | `{"purchase_option_id":null,"promo_code":null,"pwyc_price_cents":null}` |
 | `lab systems` / `status` | GET | `/api/student/courses/{playthrough}/systems?courseSystemIds=[…]` | — |
 | `lab launch` | POST | `.../systems/{sys}/launch` then `.../power` | `{"power":"on"}` |
 | `lab stop` | POST | `.../systems/{sys}/power` | `{"power":"off"}` |
@@ -204,6 +210,8 @@ The two endpoints also disagree on state vocabulary — `/courses` says
 | `lab systems` / `status` / `creds` (AWS) | GET | `/api/student/content/{playthrough}/aws-labs/{lab}` | — |
 | `lab launch` / `stop` / `reset` / `extend` (AWS) | POST | `/api/student/content/{playthrough}/aws-labs/{lab}/power` | `{"action":"start\|stop\|reset\|extend","inputs":{…}}` |
 | `lab submit` | POST | `/api/student/content/{playthrough}/lessons/{lesson}/submit-question` | `{questionId, submission}` |
+| `lab complete` | POST | `/api/student/content/{playthrough}/lessons/{lesson}/complete` | *(empty body, per lesson)* |
+| `lab certificate` | GET | `/api/student/completion/course/{completion_id}/certificate` → `{url}` | — |
 | `lab vpn` | GET | `/api/student/courses/{playthrough}/vpn` | — |
 | `lab image` | GET | `https://images.coursestack.com/{image_path}` | — |
 | `credits` | GET | `/api/student/credits/{customer_id}` | — |
@@ -221,6 +229,16 @@ The public `course.id` is **not** the id the lifecycle endpoints accept.
 `/systems`, `/launch`, `/power`, `/reset`, and `/vpn` all use
 `course.course_playthrough.id` — a separate handle created when you
 enroll. `hsmcli` auto-resolves it via `/take` transparently.
+
+Enrolling uses a *third* id. There is no `/courses/{id}/enroll` route;
+the web app claims a lab by "buying" its storefront card —
+`POST /catalog/{catalog_item_id}/buy` with a null purchase option, which
+the server resolves itself. Free labs and anything your subscription or
+a bundle covers come back `{"state":"bought"}` with nothing charged;
+anything else comes back `{"state":"checkout","session_url":…}` and
+`hsmcli` prints that link and exits 2 rather than claiming you're in.
+The card id is `catalog_item_id` on a `/courses` entry, or the top-level
+`id` of a `/catalog` entry (whose `item.id` is the course id).
 
 The `/api/student/content/{id}/…` routes (AWS labs, flag submission) want
 that **same playthrough id**, despite the `content` segment — a lesson's
@@ -280,6 +298,9 @@ Everything goes to `base_url` (`https://www.hacksmarter.org`) except:
 
 - **`images.coursestack.com`** — lab thumbnails, for `lab <name> image`.
   Public CDN, no cookies sent.
+- **`certificates-*.s3.amazonaws.com`** — completion certificate PDFs, for
+  `lab <name> certificate`. The API hands out a one-hour pre-signed URL per
+  request (there's no stable link); the download itself carries no cookies.
 - **`api.ipify.org`, `ifconfig.me`, `icanhazip.com`** — only when starting
   an AWS lab, and only as a *fallback*. AWS labs scope their security group
   to one `allowed_ip`; hsmcli prefers the `suggested_ip` the HackSmarter

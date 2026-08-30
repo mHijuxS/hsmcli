@@ -48,9 +48,12 @@ from .resolvers import (
     _item_id,
     _item_name,
     all_lab_items,
+    catalog_item_id,
+    free_purchase_option_id,
     is_uuid,
     resolve_course,
     resolve_course_id,
+    resolve_course_item,
     resolve_from_list,
     resolve_system_id,
 )
@@ -949,13 +952,69 @@ def cmd_lab_take(api: HackSmarterAPI, config: Config, args) -> int:
 
 
 def cmd_lab_enroll(api: HackSmarterAPI, config: Config, args) -> int:
-    course_id, label = _resolve_lab(api, args)
-    data = api.enroll_course(course_id)
+    """Claim a lab so the API will serve its content.
+
+    Enrollment is a catalog operation, not a course one — see
+    ``HackSmarterAPI.enroll_course``. That means resolving the lab to its
+    ``catalog_item_id``, and it means reading a reply that says one of
+    three things: the lab is yours now, it was already yours, or
+    HackSmarter wants paying for it first.
+    """
     fmt = _format_choice(args, config)
+    course_id, name, item = resolve_course_item(api, args.identifier)
+    label = lab_display_name(name) or api.course_name(course_id) or course_id
+    cat_id = catalog_item_id(item)
+    if not cat_id:
+        # Resolved to a lab, but nothing tells us which storefront card it
+        # is — a /courses entry with no catalog_item_id, or a bare UUID we
+        # couldn't match against either listing.
+        print_error(f"No catalog entry for {label}, so there's nothing to "
+                    f"enroll in.")
+        steps(("hsmcli labs list", "what your account can actually see"),
+              to_stderr=True)
+        return 2
+
+    try:
+        # Free labs like Mapper reject a null option ("A purchase option must
+        # be selected"); pass their free option id when the card lists one.
+        # Subscription-covered labs list none and take the null-option path.
+        data = api.enroll_course(
+            cat_id, purchase_option_id=free_purchase_option_id(item))
+    except HttpError as exc:
+        # Enrolling twice is a 400 "User already owns course". The state the
+        # user asked for is the state they're in, so this isn't a failure —
+        # and `hsmcli lab X enroll && hsmcli lab X launch` shouldn't stop
+        # dead the second time you run it.
+        if exc.status == 400 and "already own" in (exc.body or "").lower():
+            if fmt in ("json", "yaml"):
+                print_output({"state": "already_enrolled",
+                              "course_id": course_id}, fmt)
+                return 0
+            print_success(f"Already enrolled in {label}")
+            steps((_lab_cmd(args, "launch"), "start the machine"),
+                  (_lab_cmd(args, "info"), "objective, flags and live status"))
+            return 0
+        raise
+    reply = data if isinstance(data, dict) else {}
+    state = reply.get("state")
+
     if fmt in ("json", "yaml"):
-        print_output(data, fmt); return 0
-    # The reply is `{"success": true}` — printing it back added a line of
-    # JSON that says exactly what the ✓ already said.
+        print_output(data, fmt)
+        # Honest exit code: "checkout" means you are *not* enrolled.
+        return 2 if state == "checkout" else 0
+
+    if state == "checkout":
+        print_warning(f"{label} isn't included in your account — "
+                      f"HackSmarter wants paying for it first.")
+        if reply.get("session_url"):
+            print_info(reply["session_url"])
+        info_err("Nothing was charged; the lab is yours once that checkout "
+                 "completes.")
+        return 2
+
+    # A successful claim is `{"state": "bought", "redirect_url": …}` — the
+    # redirect is the browser's take page, which says nothing a person
+    # typing hsmcli needs, so the ✓ is the whole reply.
     print_success(f"Enrolled in {label}")
     steps((_lab_cmd(args, "launch"), "start the machine"),
           (_lab_cmd(args, "info"), "objective, flags and live status"))
@@ -2116,6 +2175,90 @@ def cmd_lab_image(api: HackSmarterAPI, config: Config, args) -> int:
     return 0
 
 
+def cmd_lab_complete(api: HackSmarterAPI, config: Config, args) -> int:
+    """Mark a lab's lessons complete — flip it from "in progress" to done.
+
+    A challenge lab is usually one lesson, so this is normally one POST; a
+    multi-lesson course gets every lesson ticked. The honest signal is what
+    /take says afterwards: `is_complete` on the playthrough. When the server
+    flips it, it also mints the certificate handle, so a finished lab ends
+    with a pointer at `certificate`.
+    """
+    fmt = _format_choice(args, config)
+    course_id, label = _resolve_lab(api, args)
+    result = api.complete_course(course_id)
+
+    if fmt in ("json", "yaml"):
+        print_output(result, fmt)
+        # Honest exit code: asking to complete a lab and it *not* being
+        # complete (unsolved flags gate it) is a non-success for a script.
+        return 0 if result.get("is_complete") else 1
+
+    newly = result.get("completed") or []
+    already = result.get("already") or []
+    if newly:
+        print_success(f"Marked {len(newly)} lesson(s) complete in {label}")
+    elif already:
+        print_info(f"Every lesson in {label} was already complete.")
+
+    if result.get("is_complete"):
+        completion_id = result.get("completion_id")
+        print_success(f"{label} is complete.")
+        if completion_id:
+            print_info(f"Certificate: {api.base_url}/completion/{completion_id}")
+            steps((_lab_cmd(args, "certificate"), "download the PDF"))
+        return 0
+
+    # Lessons done but the course still isn't — on HSM labs the certificate
+    # waits on the flags, not the reading.
+    print_warning(f"{label} isn't finished yet — its flags are still open.")
+    steps((_lab_cmd(args, "flags"), "see what's left to submit"))
+    return 1
+
+
+def cmd_lab_certificate(api: HackSmarterAPI, config: Config, args) -> int:
+    """Download the completion certificate PDF for a finished lab.
+
+    The PDF lives in a private bucket reachable only through a one-hour
+    pre-signed link the API hands out per request, so there's nothing to
+    cache: every run asks for a fresh URL. A lab that isn't complete has no
+    certificate — that's a 2, with the command that fixes it.
+    """
+    fmt = _format_choice(args, config)
+    course_id, label = _resolve_lab(api, args)
+    # Gate on is_complete, not on the completion_id: the id is minted at
+    # enroll and is always there, but the certificate itself doesn't exist
+    # (the endpoint 404s) until the lab is actually finished.
+    comp = api.course_completion(course_id)
+    completion_id = comp.get("completion_id")
+    if not comp.get("is_complete") or not completion_id:
+        print_error(f"{label} isn't complete, so there's no certificate yet.")
+        steps((_lab_cmd(args, "complete"), "mark the lessons complete"),
+              (_lab_cmd(args, "flags"), "check the flags still open"),
+              to_stderr=True)
+        return 2
+
+    completion_url = f"{api.base_url}/completion/{completion_id}"
+    if args.url_only:
+        # The signed download link, not the shareable page — `--url-only`
+        # exists to be piped into curl/wget, and the page can't be.
+        print(api.certificate_download_url(completion_id))
+        return 0
+    if fmt in ("json", "yaml"):
+        print_output({"completion_id": completion_id,
+                      "completion_url": completion_url,
+                      "download_url": api.certificate_download_url(completion_id)},
+                     fmt)
+        return 0
+
+    dest = args.output or (f"{slugify(label, fallback=f'hsm-{course_id}')}"
+                           f"-certificate.pdf")
+    data = api.download_certificate(completion_id, dest_path=dest)
+    print_success(f"Certificate for {label} → {dest} ({len(data):,} bytes)")
+    print_info(f"Shareable page: {completion_url}")
+    return 0
+
+
 # ── misc ──────────────────────────────────────────────────────────────────
 
 def _need_subcommand(command: str, actions) -> int:
@@ -2416,6 +2559,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("enroll", "enroll in the lab"),
         ("systems", "list systems (machines) in the lab with live status"),
         ("status", "quick 'is it on?' summary of the lab"),
+        ("complete", "mark the lab's lessons complete (finish the course)"),
     ]:
         _add_format_flags(lsub2.add_parser(name, help=help_text))
 
@@ -2470,6 +2614,16 @@ def build_parser() -> argparse.ArgumentParser:
     _limg.add_argument("-o", "--output", help="output file (default ./hsm-<id>.<ext>)")
     _limg.add_argument("--url-only", action="store_true",
                        help="just print the image URL, don't download")
+
+    _lcert = lsub2.add_parser(
+        "certificate",
+        aliases=["cert"],
+        help="download the completion certificate PDF (finished labs only)")
+    _lcert.add_argument("-o", "--output",
+                        help="output file (default ./<lab>-certificate.pdf)")
+    _lcert.add_argument("--url-only", action="store_true",
+                        help="print the one-hour signed download URL, don't save")
+    _add_format_flags(_lcert)
 
     _lfl = lsub2.add_parser("flags", help="list flags / questions in the lab")
     _add_format_flags(_lfl)
@@ -2588,6 +2742,9 @@ def _run() -> int:
                 "image": cmd_lab_image,
                 "flags": cmd_lab_flags,
                 "submit": cmd_lab_submit,
+                "complete": cmd_lab_complete,
+                "certificate": cmd_lab_certificate,
+                "cert": cmd_lab_certificate,
             }
             fn = table.get(args.subcommand)
             if not fn:

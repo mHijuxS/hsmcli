@@ -477,8 +477,35 @@ class HackSmarterAPI:
             return ""
         return str(_take_course(take).get("name") or "")
 
-    def enroll_course(self, course_id: str) -> Dict[str, Any]:
-        return self._request("POST", f"/api/student/courses/{course_id}/enroll")
+    def enroll_course(self, catalog_item_id: str,
+                      purchase_option_id: Optional[str] = None,
+                      promo_code: Optional[str] = None) -> Dict[str, Any]:
+        """Enroll in a lab — claim it, or start paying for it.
+
+        There is no ``/courses/{id}/enroll``: it 404s for every lab, always
+        did, and the API has no such route. The web app enrolls by "buying"
+        the lab's *catalog card*, with a null purchase option, and lets the
+        server work out what that means::
+
+            POST /api/student/catalog/{catalog_item_id}/buy
+            {"purchase_option_id": null, "promo_code": null,
+             "pwyc_price_cents": null}
+
+        Free labs and the ones your subscription or a bundle already covers
+        come back ``{"state": "bought", "redirect_url": …}`` — nothing is
+        charged. A lab you don't have access to comes back
+        ``{"state": "checkout", "session_url": …}``: a Stripe link, and
+        nothing happens to your account (or your card) until you follow it.
+
+        Note the id: this is the *catalog* id — ``catalog_item_id`` on a
+        /courses entry — not the course id the lifecycle endpoints take.
+        """
+        return self._request(
+            "POST", f"/api/student/catalog/{catalog_item_id}/buy",
+            data={"purchase_option_id": purchase_option_id,
+                  "promo_code": promo_code,
+                  "pwyc_price_cents": None},
+        )
 
     # ── lab lifecycle (systems + networks + aws) ──────────────────────────
 
@@ -531,6 +558,12 @@ class HackSmarterAPI:
         return {
             "playthrough_id": playthrough_id,
             "lesson_id": lesson_id,
+            # A finished course carries these on its playthrough: the server
+            # flips `is_complete` once every lesson (and scored question) is
+            # done, and mints a `completion_id` — the public certificate
+            # handle the /completion page and the certificate download take.
+            "is_complete": bool((playthrough or {}).get("is_complete")),
+            "completion_id": (playthrough or {}).get("completion_id"),
             "course_id": body.get("id") if isinstance(body, dict) else course_id,
             "customer_id": body.get("customer_id") if isinstance(body, dict) else None,
             "system_ids": system_ids,
@@ -952,6 +985,151 @@ class HackSmarterAPI:
             {"questionId": question_id, "submission": submission},
             take_referer,
         )
+
+    def complete_lesson(self, course_id: str, lesson_id: str) -> Dict[str, Any]:
+        """Mark one lesson done — the "in progress → complete" toggle.
+
+        Endpoint: ``POST /api/student/content/{playthrough}/lessons/
+        {lesson_id}/complete`` with an empty body. Same shape and same
+        conventions as :meth:`submit_question`: the ``/content/`` segment is
+        the *playthrough* id (the lesson's own ``content.id`` 403s), and the
+        server checks the ``Referer`` against ``/courses/{course_id}/take``.
+
+        The reply carries nothing worth reading (``{}`` / ``{"success":
+        true}``) — completion state is what you read back off /take
+        afterwards, on ``course_playthrough`` — so callers that need to know
+        whether the *course* is finished should re-fetch /take, not parse
+        this.
+        """
+        pt = self._ensure_playthrough(course_id)
+        playthrough_id = pt["playthrough_id"]
+        if not playthrough_id:
+            raise NotEnrolledError("no active playthrough — enroll first")
+        real_course_id = pt["course_id"] or course_id
+        take_referer = f"{self.base_url}/courses/{real_course_id}/take"
+        return self._power_call(
+            "POST",
+            f"/api/student/content/{playthrough_id}/lessons/{lesson_id}/complete",
+            None,
+            take_referer,
+        )
+
+    def complete_course(self, course_id: str) -> Dict[str, Any]:
+        """Mark every lesson in a lab complete, then report where that left it.
+
+        A course is "complete" once all its lessons are — there is no single
+        "finish the course" endpoint, so this walks the lessons and POSTs
+        :meth:`complete_lesson` for each one.
+
+        It POSTs *every* lesson, including ones /take already shows as
+        ``completed``. That flag tracks progress/having-viewed a lesson and
+        can be set without the completing POST ever landing, so it's the
+        POST — not the flag — that flips ``course_playthrough.is_complete``.
+        The call is idempotent, so re-marking a genuinely-finished lesson
+        costs nothing; skipping one that only *looked* done would leave the
+        course stuck in progress. The summary still distinguishes the two so
+        the caller can say what changed.
+
+        Re-reads /take afterwards — bypassing the cache, since we just
+        mutated the thing it caches — so the returned ``is_complete`` and
+        ``completion_id`` reflect the finished state, including the
+        certificate handle the server mints on the last lesson.
+
+        Returns ``{"completed": [lesson_id, …], "already": [lesson_id, …],
+        "is_complete": bool, "completion_id": str | None}`` — ``completed``
+        are the lessons that weren't showing done beforehand, ``already``
+        the ones that were; both got the POST.
+        """
+        take = self.get_course_take(course_id)
+        lessons = self.extract_lessons(take)
+        if not lessons:
+            raise NotEnrolledError(
+                "no lessons on this lab — enroll first, or it has no content")
+        newly, already = [], []
+        for les in lessons:
+            lid = les.get("lesson_id")
+            if not lid:
+                continue
+            self.complete_lesson(course_id, lid)
+            (already if les.get("completed") else newly).append(lid)
+        # State moved under us; drop the cached /take so the playthrough we
+        # read back shows the completion the last POST just triggered.
+        self._take_cache.pop(course_id, None)
+        pt = self._ensure_playthrough(course_id)
+        return {
+            "completed": newly,
+            "already": already,
+            "is_complete": pt.get("is_complete", False),
+            "completion_id": pt.get("completion_id"),
+        }
+
+    def course_completion(self, course_id: str) -> Dict[str, Any]:
+        """``{"is_complete": bool, "completion_id": str | None}`` for a lab.
+
+        Both come off ``course_playthrough``. Crucially they are
+        *independent*: the ``completion_id`` handle is minted at enroll and
+        is present the whole time — it is **not** proof the lab is finished.
+        ``is_complete`` is the real signal, and the certificate endpoint
+        404s until it flips, so anything gating on "can I download the
+        certificate?" must check ``is_complete``, not the id's presence.
+        """
+        pt = self._ensure_playthrough(course_id)
+        return {"is_complete": pt.get("is_complete", False),
+                "completion_id": pt.get("completion_id")}
+
+    def completion_id_for_course(self, course_id: str) -> Optional[str]:
+        """The public certificate handle on the playthrough, or ``None``.
+
+        Present from enroll onward, so it does **not** mean the lab is
+        finished — see :meth:`course_completion`, and gate downloads on its
+        ``is_complete``, not on this being non-``None``.
+        """
+        return self._ensure_playthrough(course_id).get("completion_id")
+
+    def certificate_download_url(self, completion_id: str) -> str:
+        """Ask the API for a fresh, time-limited certificate download URL.
+
+        ``GET /api/student/completion/course/{completion_id}/certificate``
+        returns ``{"url": …}`` — a pre-signed S3 link to the certificate PDF
+        that expires in an hour. The PDF itself sits in a private bucket, so
+        this indirection is the only way to it; there's no stable URL to
+        cache.
+        """
+        data = self._request(
+            "GET",
+            f"/api/student/completion/course/{completion_id}/certificate",
+        )
+        url = data.get("url") if isinstance(data, dict) else None
+        if not url:
+            raise HttpError(
+                "certificate endpoint returned no download URL",
+                status=200,
+                endpoint=(f"/api/student/completion/course/"
+                          f"{completion_id}/certificate"),
+                body=json.dumps(data) if data else "",
+            )
+        return str(url)
+
+    def download_certificate(
+        self, completion_id: str, dest_path: Optional[str] = None
+    ) -> bytes:
+        """Fetch the certificate PDF bytes for a completed lab.
+
+        Two hops: resolve the pre-signed URL via
+        :meth:`certificate_download_url`, then GET the PDF straight from S3.
+        That second GET is a plain request — the signed URL carries its own
+        auth, it isn't under ``base_url``, and sending the session cookie to
+        S3 would only confuse it — mirroring :meth:`download_lab_image`.
+        Writes to ``dest_path`` when given, and always returns the bytes.
+        """
+        url = self.certificate_download_url(completion_id)
+        r = requests.get(url, stream=True)
+        r.raise_for_status()
+        content = r.content
+        if dest_path:
+            with open(dest_path, "wb") as f:
+                f.write(content)
+        return content
 
     @staticmethod
     def extract_lessons(take_payload: Any) -> List[Dict[str, Any]]:
