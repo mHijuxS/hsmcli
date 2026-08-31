@@ -343,8 +343,10 @@ def _rendered(outputs, width):
 def test_creds_body_keeps_every_secret_whole():
     """A truncated secret is worse than an ugly one: it looks like a key
     and fails like a typo."""
+    # AKIAIOSFODNN7EXAMPLE is AWS's documented placeholder key id — a
+    # realistic-looking one trips GitHub push protection and trufflehog.
     outputs = {"cloudgoat_output_chris_secret_key": "X" * 40,
-               "cloudgoat_output_chris_access_key_id": "AKIAWXB5ELPOR2QGLBHI"}
+               "cloudgoat_output_chris_access_key_id": "AKIAIOSFODNN7EXAMPLE"}
     for width in (60, 76, 100, 200):
         text = _rendered(outputs, width)
         assert "…" not in text

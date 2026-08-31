@@ -8,10 +8,14 @@ Modeled after `htbcli` and `hccli`: rich terminal output, name-based
 identifier resolution, JSON/YAML output for scripting, cookie-based auth.
 
 > **Unofficial.** Not affiliated with, endorsed by, or supported by Hack
-> Smarter. It drives the same private JSON API the web app uses — which is
-> undocumented and can change without notice, so expect breakage. Check
-> Hack Smarter's terms of service before using it, and use it only with
-> your own account and your own labs.
+> Smarter or CourseStack (who manage the backend platform). It drives
+> exactly the endpoints a logged-in browser session uses — the same
+> private JSON API the web app calls, with your own session — which is
+> undocumented and can change without notice, so expect breakage. Hack
+> Smarter's creator has said informally this is fine; the backend is
+> CourseStack's, so their terms apply too. Use it only with your own
+> account and your own labs. Requests identify themselves as `hsmcli`
+> (no browser spoofing), so the operators can always see and throttle it.
 
 ## Install
 
@@ -28,24 +32,47 @@ pip install .
 
 ## Auth
 
-HackSmarter uses a Supabase session split across two cookies
-(`sb-auth-auth-token.0` and `.1`). Log in on
-<https://www.hacksmarter.org>, open devtools → Application → Cookies, copy
-the whole `Cookie:` header for `www.hacksmarter.org`, then:
-
 ```bash
-hsmcli config set-cookie 'sb-auth-auth-token.0=base64-…; sb-auth-auth-token.1=…'
-# or paste from stdin
-xclip -selection clipboard -o | hsmcli config set-cookie -
+hsmcli auth login
 ```
 
-Override via env var: `export HSMCLI_COOKIE='…'`.
+is a **guided secure cookie import** — honest name: it opens HackSmarter
+in your browser and you sign in as usual (email, or the GitHub button;
+`--github` points the guidance at that button, it does *not* start an
+OAuth flow itself — the imported session is identical either way), but
+you still copy the `Cookie:` header from devtools → Network → any request
+→ Request Headers → Cookie yourself. The paste goes into a **hidden
+prompt**, so the token never lands in your shell history, scrollback or
+`ps`. The CLI keeps only the Supabase auth chunks (`sb-auth-auth-token.N`
+— a header without them is rejected, nothing saved), **verifies the paste
+against the API first**, and only then replaces the stored session — a
+bad paste can't clobber one that still works.
 
-Verify:
+HackSmarter has no official CLI auth endpoint, so a proper PKCE /
+device-code flow isn't possible for an unofficial client — the browser
+does the login (including OAuth and MFA) and hsmcli imports the session
+it produced. Nothing here ever sees your password.
+
+**Renewal:** hsmcli does not refresh the Supabase token itself. When the
+session expires (`hsmcli auth status` shows how long is left), the
+current renewal path is running `hsmcli auth login` again.
+
+For scripts and secret managers:
 
 ```bash
-hsmcli whoami
+secret-tool lookup service hsmcli | hsmcli auth import-cookie -
+export HSMCLI_COOKIE='…'          # env override (mind your shell history)
 ```
+
+Manage the session:
+
+```bash
+hsmcli auth status                # who, until when, stored where (exit 1 if not signed in)
+hsmcli auth logout                # remove the stored session
+hsmcli whoami                     # full profile, via the API
+```
+
+`config set-cookie` still works but is deprecated in favour of the above.
 
 ## Cheat sheet
 
@@ -80,9 +107,15 @@ hsmcli lab <name> launch                # /launch + /power on, then poll until r
 hsmcli lab <name> launch --no-wait      # return immediately after /power ACKs
 hsmcli lab <name> stop                  # /power off
 hsmcli lab <name> reset                 # /reset (new IP assigned)
-hsmcli lab <name> vpn                   # download OpenVPN config to ./<lab>.ovpn
+hsmcli lab <name> vpn                   # download OpenVPN config to ./<lab>.ovpn (0600)
 hsmcli lab <name> vpn -o me.ovpn        # …or wherever you want it
+hsmcli lab <name> vpn --print           # profile on stdout, nothing else — pipe it anywhere
 hsmcli lab <name> image                 # download the lab thumbnail (--url-only to just print the URL)
+
+# Flags
+hsmcli lab <name> flags                 # list the lab's flags and their state
+hsmcli lab <name> submit user '<flag>'  # submit by role, 1-based index, UUID or prompt substring
+hsmcli lab <name> submit 2 '<flag>' --force   # resubmit an already-solved one
 
 # Finishing a lab
 hsmcli lab <name> complete              # mark its lessons complete (in progress → done)
@@ -107,9 +140,17 @@ hsmcli notifications | events | exams
 
 # Misc
 hsmcli heartbeat <name>                 # POST /api/heartbeat (keeps session warm)
+hsmcli config show                      # session state, base URL, output format, config path
+hsmcli config set-format json           # default output format (also: set-base-url, reset)
 ```
 
-Every command accepts `--json` / `--yaml` for scripting. `--debug` traces
+Downloads (`vpn`, `image`, `certificate`) never overwrite an existing file
+silently: at a terminal you're asked, in a script they fail unless you pass
+`--force`.
+
+Every listing/lifecycle command accepts `--json` / `--yaml` for scripting
+(the file-download commands `vpn` and `image` don't — `vpn --print` and
+`image --url-only` are their pipeable forms). `--debug` traces
 every request and response to **stderr** — one line per call plus the
 payload — so it composes with the normal output:
 
@@ -147,11 +188,14 @@ $ hsmcli lab dark launch
   → hsmcli lab dark enroll  free, and takes a second
 ```
 
-Error messages and their follow-up commands go to **stderr**, so
-`--json > out.json` never picks up prose. The API's own vocabulary
-(`na`, `in_progress`, `not_launched`) is translated for human output only:
-`--json` always emits exactly what HackSmarter said, so scripts keep
-matching on `running`.
+Errors, warnings, progress and their follow-up commands go to **stderr**,
+so `--json > out.json` never picks up prose. In structured mode a command
+emits **exactly one document** on stdout — `launch --json` waits (by
+default) and emits the final live state, not the power-on ACK; add
+`--no-wait` for the ACK. The API's own vocabulary (`na`, `in_progress`,
+`not_launched`) is translated for human output only: `--json` always
+emits exactly what HackSmarter said, so scripts keep matching on
+`running`.
 
 ### Name resolution
 
@@ -317,19 +361,31 @@ Stored at `~/.hsmcli/config.json` (override with `--config-dir`).
 
 Keys:
 
-- `cookie` — the whole `Cookie:` header
-- `base_url` — defaults to `https://www.hacksmarter.org`
+- `cookie` — the Supabase auth chunks only (`sb-auth-auth-token.N`);
+  the rest of a pasted browser header is discarded at sign-in
+- `base_url` — defaults to `https://www.hacksmarter.org`; must be
+  `https://` (an `http://` URL would send the session in cleartext —
+  `--allow-insecure-http` exists for local development only)
 - `output_format` — `table` (default) | `json` | `yaml`
 
 Env vars:
 
-- `HSMCLI_COOKIE` — overrides the stored cookie
+- `HSMCLI_COOKIE` — overrides the stored cookie (note: env vars can end up
+  in shell history and are inherited by child processes; the config file
+  is the safer default)
 - `HSMCLI_USER_AGENT` — overrides the request `User-Agent`
+- `HSMCLI_DEBUG_RAW=1` — disables the `--debug` trace's masking of
+  credential-bearing response fields (IAM keys, signed URLs)
 
-The config file holds your whole Supabase session — access token *and*
-refresh token — so it is created `0600` inside a `0700` directory, and a
-looser mode left by an earlier version is tightened on next run. Treat it
-like an SSH key.
+The config file holds your Supabase session — access token *and* refresh
+token — so it is created `0600` inside a `0700` directory (writes are
+atomic), and a looser mode left by an earlier version is tightened on next
+run. A pre-existing custom `--config-dir` is left with the permissions it
+has. Treat the file like an SSH key. Downloaded VPN profiles carry a
+private key too, and are written `0600` as well.
+
+Every API request carries a connect/read timeout (5s/30s; 120s read for
+downloads), so a stalled server fails loudly instead of hanging the CLI.
 
 ## What it talks to
 
@@ -360,8 +416,9 @@ that need it), so there's nothing to work around. If that ever changes,
 |---|---|
 | 0 | success |
 | 1 | the request failed (auth, HTTP error, network) |
-| 2 | your invocation was wrong — bad/missing action, ambiguous name, no match, not enrolled |
+| 2 | your invocation was wrong — bad/missing action, ambiguous name, no match, not enrolled, refused overwrite |
 | 130 | interrupted (Ctrl-C) |
+| 141 | downstream closed the pipe (`hsmcli … \| head`) — silent, like any Unix tool |
 
 `launch --wait` returns 2 on timeout as well: the machine may still be
 coming up, so it isn't a failure.
@@ -414,8 +471,10 @@ Python 3.9+, `requests`, `PyYAML`, `rich`. CI tests 3.9 through 3.14.
 
 ## Releasing
 
-Not published to any index yet — the repo is private while the ToS question
-above is open. The path is prepared, though:
+Not published to any index yet. The tool only reaches what the browser
+reaches and Hack Smarter's creator has said it's fine; a formal nod from
+CourseStack (who run the backend) is the last box before a public index.
+The path is prepared, though:
 
 1. Bump `version` in `pyproject.toml` and add a `CHANGELOG.md` entry.
 2. `git tag -a vX.Y.Z -m "…" && git push --tags`

@@ -42,8 +42,10 @@ def test_cookie_file_is_owner_only(tmp_path):
     assert not mode & (stat.S_IRGRP | stat.S_IROTH)
 
 
-def test_existing_loose_permissions_are_repaired(tmp_path):
-    """A config written by an older version was 0644; opening it tightens."""
+def test_existing_loose_file_permissions_are_repaired(tmp_path):
+    """A config written by an older version was 0644; opening it tightens
+    the *file*. The pre-existing custom directory is left alone — chmod-ing
+    whatever --config-dir points at silently privatised shared dirs."""
     d = tmp_path / "cfg"
     d.mkdir()
     f = d / "config.json"
@@ -53,8 +55,23 @@ def test_existing_loose_permissions_are_repaired(tmp_path):
 
     c = Config(str(d))
     assert _mode(f) == FILE_MODE
-    assert _mode(d) == DIR_MODE
+    assert _mode(d) == 0o755         # not ours to tighten
     assert c.get_cookie() == "a=1"   # and the content survived
+
+
+def test_default_dir_permissions_are_repaired(tmp_path, monkeypatch):
+    """~/.hsmcli is ours: a loose mode there *is* repaired."""
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    d = tmp_path / ".hsmcli"
+    d.mkdir()
+    os.chmod(d, 0o755)
+    Config()
+    assert _mode(d) == DIR_MODE
+
+
+def test_freshly_created_custom_dir_is_owner_only(tmp_path):
+    c = Config(str(tmp_path / "made-by-us"))
+    assert _mode(c.config_dir) == DIR_MODE
 
 
 def test_rewrite_keeps_tight_permissions(tmp_path):

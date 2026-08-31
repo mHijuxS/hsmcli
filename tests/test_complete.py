@@ -259,7 +259,8 @@ def test_complete_command_when_flags_still_open_is_a_nonzero(cfg, capsys):
                                       "is_complete": False,
                                       "completion_id": None})
     assert cmd_lab_complete(api, cfg, _args("widget")) == 1
-    assert "isn't finished" in capsys.readouterr().out
+    # Warnings are diagnostics: stderr, so --json > file stays clean.
+    assert "isn't finished" in capsys.readouterr().err
 
 
 def test_complete_command_json_exit_code_follows_is_complete(cfg):

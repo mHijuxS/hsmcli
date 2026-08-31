@@ -2,7 +2,7 @@
 """hsmcli — HackSmarter CLI.
 
 Commands:
-    hsmcli config set-cookie "<paste Cookie header>"
+    hsmcli auth login | import-cookie | status | logout
     hsmcli config show
     hsmcli whoami
     hsmcli labs list [--search q] [--topic ad] [--difficulty hard]
@@ -64,6 +64,7 @@ from .ui import (
     badge as _badge,
     console,
     disable_color,
+    err_console,
     human_duration,
     info_err,
     human_state,
@@ -183,39 +184,55 @@ def cmd_config_show(config: Config, args) -> int:
     console.print(Panel(t, title="hsmcli config", title_align="left",
                         border_style="cyan", padding=(0, 1)))
     if not config.get_cookie():
-        steps(("hsmcli config set-cookie '<paste Cookie header>'", "sign in"))
+        steps(("hsmcli auth login", "sign in"))
     return 0
 
 
-def cmd_config_set_cookie(config: Config, args) -> int:
-    cookie = args.cookie
-    if cookie == "-":
-        cookie = sys.stdin.read()
+def _auth_chunk_order(name: str) -> Tuple[int, int, str]:
+    """Sort key that puts ``…auth-token.0`` before ``…auth-token.10``."""
+    tail = name.rsplit(".", 1)[-1]
+    return (0, int(tail), name) if tail.isdigit() else (1, 0, name)
 
-    # Validate before storing. A bare token pasted without its `name=` used
-    # to save fine and then fail every call with "cookie may be expired",
-    # which sends you looking in the wrong place.
+
+# Exactly `sb-auth-auth-token.<N>` — startswith would also accept
+# unrelated names that merely share the prefix.
+_AUTH_CHUNK_RE = re.compile(re.escape(AUTH_COOKIE_BASE) + r"\.\d+$")
+
+
+def _clean_cookie(cookie: str) -> Tuple[Optional[str], Dict[str, str], str]:
+    """``(cookie_to_store, parsed_header, error)`` for a pasted header.
+
+    Keeps only the Supabase session chunks (``sb-auth-auth-token.N``) —
+    the full browser header carries analytics and third-party cookies the
+    CLI has no business persisting. A header with none of them is rejected
+    outright: storing it would only fail later with "cookie may be
+    expired", which sends you looking in the wrong place. (Power users
+    with a genuinely different cookie name still have $HSMCLI_COOKIE.)
+    """
     parsed = parse_cookie_header(cookie)
     if not parsed:
-        print_error(
+        return None, {}, (
             "That doesn't look like a Cookie header — expected 'name=value' "
             "pairs separated by ';'. Copy the whole header from devtools → "
             "Network → any request → Request Headers → Cookie."
         )
-        return 2
-    chunks = sum(1 for k in parsed if k.startswith(AUTH_COOKIE_BASE))
-    if not chunks:
-        # Don't hard-fail: the cookie name is HackSmarter's to change, and a
-        # user who knows better shouldn't be blocked by our expectations.
-        print_warning(
-            f"No '{AUTH_COOKIE_BASE}.N' cookie in that header — auth will "
-            f"likely fail. Saving anyway."
+    auth = {k: v for k, v in parsed.items() if _AUTH_CHUNK_RE.fullmatch(k)}
+    if not auth:
+        return None, parsed, (
+            f"No HackSmarter authentication cookies "
+            f"('{AUTH_COOKIE_BASE}.N') in that header — nothing was saved. "
+            f"Copy the Cookie request header from a signed-in HackSmarter "
+            f"request."
         )
-    config.set_cookie(cookie)
+    return ("; ".join(f"{k}={parsed[k]}"
+                      for k in sorted(auth, key=_auth_chunk_order)),
+            parsed, "")
 
-    # Name who we just signed in as. It's the difference between "something
-    # was written to a file" and "you are logged in", and it catches the
-    # classic mistake of copying the cookie from the wrong browser profile.
+
+def _announce_signin(parsed: Dict[str, str]) -> None:
+    """Name who just signed in. It's the difference between "something was
+    written to a file" and "you are logged in", and it catches the classic
+    mistake of copying the cookie from the wrong browser profile."""
     session = decode_supabase_session(parsed) or {}
     who = ((session.get("user") or {}).get("email")
            or ((session.get("user") or {}).get("user_metadata") or {})
@@ -223,7 +240,30 @@ def cmd_config_set_cookie(config: Config, args) -> int:
     print_success(f"Signed in as {who}" if who else "Cookie saved.")
     steps(("hsmcli whoami", "confirm the session"),
           ("hsmcli labs list", "see your labs"))
+
+
+def _store_cookie(config: Config, cookie: str) -> int:
+    """Validate, filter to the auth chunks, save — no network round-trip.
+
+    The piped path (`auth import-cookie -`, the deprecated `config
+    set-cookie`); `auth login` verifies against the API before saving.
+    """
+    cleaned, parsed, err = _clean_cookie(cookie)
+    if err:
+        print_error(err)
+        return 2
+    config.set_cookie(cleaned)
+    _announce_signin(parsed)
     return 0
+
+
+def cmd_config_set_cookie(config: Config, args) -> int:
+    info_err("`hsmcli config set-cookie` is deprecated — use `hsmcli auth "
+             "login` (hidden prompt) or `hsmcli auth import-cookie -`.")
+    cookie = args.cookie
+    if cookie == "-":
+        cookie = sys.stdin.read()
+    return _store_cookie(config, cookie)
 
 
 def cmd_config_clear_cookie(config: Config, args) -> int:
@@ -233,8 +273,17 @@ def cmd_config_clear_cookie(config: Config, args) -> int:
 
 
 def cmd_config_set_base_url(config: Config, args) -> int:
-    config.set_base_url(args.url)
-    print_success(f"Base URL set to {args.url}")
+    try:
+        config.set_base_url(args.url,
+                            allow_insecure=getattr(args, "allow_insecure_http",
+                                                   False))
+    except ValueError as e:
+        print_error(str(e))
+        return 2
+    if getattr(args, "allow_insecure_http", False):
+        print_warning("Insecure base URL — your session cookie will travel "
+                      "unencrypted.")
+    print_success(f"Base URL set to {config.get_base_url()}")
     return 0
 
 
@@ -250,6 +299,202 @@ def cmd_config_reset(config: Config, args) -> int:
     return 0
 
 
+# ── auth ──────────────────────────────────────────────────────────────────
+#
+# Signing in is a first-class act, not a configuration detail. The ideal —
+# a PKCE/device-code flow where the browser does the login and the CLI never
+# sees a password — needs an endpoint HackSmarter doesn't offer an unofficial
+# client, so until then: a *guided secure cookie import* — a hidden prompt
+# that keeps the pasted header out of shell history and process listings,
+# verified against the API before it replaces anything — plus a piped
+# fallback for scripts.
+
+
+class _CandidateConfig:
+    """Just enough Config for HackSmarterAPI to verify a *candidate* cookie.
+
+    Deliberately not the real Config: verification must test the paste —
+    not the stored session it would replace, and not $HSMCLI_COOKIE, which
+    the real ``get_cookie()`` prefers.
+    """
+
+    def __init__(self, base_url: str, cookie: str):
+        self._base_url = base_url
+        self._cookie = cookie
+
+    def get_base_url(self) -> str:
+        return self._base_url
+
+    def get_cookie(self) -> str:
+        return self._cookie
+
+def cmd_auth_login(config: Config, args) -> int:
+    """Guided secure cookie import — not an automatic browser login.
+
+    The browser is opened and the paste is guided, hidden (``getpass``
+    keeps the token out of shell history, scrollback and ``ps``) and
+    verified before it replaces anything — but the user still copies the
+    Cookie header from devtools themselves.
+
+    ``--github`` only changes the guidance to name the site's GitHub
+    button; it does NOT start an OAuth flow. HackSmarter's GitHub login
+    lands in exactly the same Supabase cookie as an email login, so the
+    import side is identical. (A real PKCE/device-code flow needs a
+    redirect HackSmarter would have to register for us; until then the
+    browser does the OAuth dance and we import the session it produced.)
+    """
+    import getpass
+
+    if not sys.stdin.isatty():
+        # getpass on a pipe half-works (reads stdin, warns on stderr) but
+        # the explicit command says what it's doing.
+        info_err("stdin isn't a terminal — reading the Cookie header from "
+                 "it directly (same as `hsmcli auth import-cookie -`).")
+        return _store_cookie(config, sys.stdin.read())
+
+    site = config.get_base_url()
+    opened = False
+    if not getattr(args, "no_browser", False):
+        import webbrowser
+        try:
+            opened = webbrowser.open(site)
+        except Exception:
+            opened = False
+
+    github = getattr(args, "github", False)
+    how = ("sign in with the “Sign in with GitHub” button" if github
+           else "sign in as usual (email, or the GitHub button)")
+    err_console.print(Text.assemble(
+        (("Opening " if opened else "Log in at "), ""),
+        (site, "cmd"),
+        (f"{' in your browser' if opened else ''} — {how}.\n", ""),
+        ("Then copy the Cookie header:\n", ""),
+        ("  devtools → Network → any request → Request Headers → Cookie\n",
+         "muted"),
+        ("\nThe pasted value is hidden and won't enter your shell history.",
+         "muted"),
+    ))
+    try:
+        cookie = getpass.getpass("Cookie: ")
+    except (EOFError, KeyboardInterrupt):
+        print_error("No cookie entered.")
+        return 1
+    if not cookie.strip():
+        print_error("No cookie entered.")
+        return 1
+    import os
+
+    cleaned, parsed, err = _clean_cookie(cookie)
+    if err:
+        print_error(err)
+        return 2
+
+    # Verify the *candidate* against the live API before anything is
+    # saved: a mis-copied or expired paste must fail here — without
+    # clobbering a stored session that still works, and without the ✓
+    # coming first. The shim also sidesteps $HSMCLI_COOKIE, which a
+    # Config-backed client would verify instead of the paste.
+    try:
+        HackSmarterAPI(_CandidateConfig(site, cleaned)).get_profile()
+    except AuthError:
+        print_error("HackSmarter rejected that session — nothing was "
+                    "saved. Copy a fresh Cookie header and try again.")
+        return 1
+    except TransportError as e:
+        print_warning(f"Couldn't reach the API to verify ({e}) — saving "
+                      f"unverified; `hsmcli whoami` will tell you once "
+                      f"you're back online.")
+    except Exception as e:
+        print_warning(f"Couldn't verify against the API ({e}) — saving "
+                      f"unverified.")
+
+    config.set_cookie(cleaned)
+    _announce_signin(parsed)
+    if os.getenv("HSMCLI_COOKIE"):
+        print_warning("$HSMCLI_COOKIE is set and overrides the saved "
+                      "session — unset it so this login takes effect.")
+    return 0
+
+
+def cmd_auth_import_cookie(config: Config, args) -> int:
+    """Non-interactive counterpart of ``auth login`` — for scripts and
+    secret managers: ``secret-tool lookup … | hsmcli auth import-cookie -``.
+    """
+    cookie = args.cookie
+    if cookie is None or cookie == "-":
+        cookie = sys.stdin.read()
+    return _store_cookie(config, cookie)
+
+
+def cmd_auth_status(config: Config, args) -> int:
+    import os
+    from datetime import datetime, timezone
+
+    fmt = _format_choice(args, config)
+    cookie = config.get_cookie()
+    parsed = parse_cookie_header(cookie) if cookie else {}
+    session = decode_supabase_session(parsed) or {}
+    user = session.get("user") or {}
+    expires = session.get("expires_at")
+    expired = False
+    if expires:
+        try:
+            expired = (datetime.fromtimestamp(int(expires), tz=timezone.utc)
+                       <= datetime.now(timezone.utc))
+        except (ValueError, OSError, OverflowError):
+            pass
+    source = ("$HSMCLI_COOKIE" if os.getenv("HSMCLI_COOKIE")
+              else config.get_config_path())
+
+    # "Signed in" means a session we can actually decode and that hasn't
+    # expired — a stored-but-undecodable cookie must not hand a green exit
+    # code to a script while every API call 401s.
+    ok = bool(cookie) and bool(session) and not expired
+    if fmt in ("json", "yaml"):
+        print_output({
+            "signed_in": ok,
+            "stored": bool(cookie),
+            "email": user.get("email"),
+            "expires_at": expires,
+            "source": source if cookie else None,
+        }, fmt)
+        return 0 if ok else 1
+
+    if not cookie:
+        print_error("Not signed in.")
+        steps(("hsmcli auth login", "sign in"), to_stderr=True)
+        return 1
+    if not session:
+        print_warning("A cookie is stored, but it isn't a decodable "
+                      "HackSmarter session.")
+        steps(("hsmcli auth login", "sign in again"), to_stderr=True)
+        return 1
+    t = Table(show_header=False, box=None, padding=(0, 2))
+    t.add_column("field", style="dim")
+    t.add_column("value", overflow="fold")
+    t.add_row("session", _cookie_summary(config))
+    t.add_row("stored in", source)
+    console.print(Panel(t, title="hsmcli auth", title_align="left",
+                        border_style="cyan", padding=(0, 1)))
+    if expired:
+        steps(("hsmcli auth login", "the session expired — sign in again"),
+              to_stderr=True)
+        return 1
+    return 0
+
+
+def cmd_auth_logout(config: Config, args) -> int:
+    import os
+    had = bool(config._config.get("cookie")) if hasattr(config, "_config") else True
+    config.clear_cookie()
+    print_success("Signed out — stored session removed."
+                  if had else "No stored session to remove.")
+    if os.getenv("HSMCLI_COOKIE"):
+        print_warning("$HSMCLI_COOKIE is set and still overrides the file — "
+                      "unset it to finish signing out.")
+    return 0
+
+
 # ── whoami / profile ──────────────────────────────────────────────────────
 
 def cmd_whoami(api: HackSmarterAPI, config: Config, args) -> int:
@@ -261,18 +506,19 @@ def cmd_whoami(api: HackSmarterAPI, config: Config, args) -> int:
         profile = {"error": str(e)}
 
     payload = {"session": session, "profile": profile}
-    if fmt == "json":
-        print_json(payload)
-        return 0
-    if fmt == "yaml":
-        print_yaml(payload)
-        return 0
+    if fmt in ("json", "yaml"):
+        print_output(payload, fmt)
+        # The embedded error is still emitted for the script to read, but a
+        # whoami that couldn't authenticate is not exit 0 — a monitor
+        # matching on the code alone must see the failure.
+        broken = (not session
+                  or (isinstance(profile, dict) and "error" in profile))
+        return 1 if broken else 0
 
     if not session:
         print_warning("No decoded session — the stored cookie isn't a "
                       "HackSmarter one.")
-        steps(("hsmcli config set-cookie '<paste Cookie header>'",
-               "log in again"), to_stderr=True)
+        steps(("hsmcli auth login", "log in again"), to_stderr=True)
         return 1
 
     body = Text()
@@ -1443,6 +1689,10 @@ def _lookup_target(api: HackSmarterAPI, course_id: str,
 def cmd_lab_launch(api: HackSmarterAPI, config: Config, args) -> int:
     import time
     fmt = _format_choice(args, config)
+    # One contract for scripts: --json/--yaml emits exactly one document on
+    # stdout — the final state after any wait — and every bit of prose
+    # (progress, warnings, hints) either goes to stderr or doesn't happen.
+    structured = fmt in ("json", "yaml")
     course_id, label = _resolve_lab(api, args)
 
     # AWS labs have no VM to power on — different endpoint, different
@@ -1501,10 +1751,11 @@ def cmd_lab_launch(api: HackSmarterAPI, config: Config, args) -> int:
 
     booting = state in BOOTING_STATES
     if booting:
-        if fmt in ("json", "yaml") and not args.wait:
+        if structured and not args.wait:
             print_output(current, fmt); return 0
-        print_info(f"{target} is already {human_state(state)} — "
-                   f"picking up the existing boot.")
+        if not structured:
+            print_info(f"{target} is already {human_state(state)} — "
+                       f"picking up the existing boot.")
     else:
         # Kick a heartbeat before launching so the server treats us as an
         # "active" viewer (the browser does the same on the /take page).
@@ -1514,11 +1765,12 @@ def cmd_lab_launch(api: HackSmarterAPI, config: Config, args) -> int:
             pass  # non-fatal — launch will still be attempted
 
         data = api.launch_system(course_id, system_id)
-        if fmt in ("json", "yaml"):
+        if structured and not args.wait:
             print_output(data, fmt); return 0
-        print_success(f"Starting {target}")
-        if isinstance(data, dict) and data.get("message") and not args.wait:
-            print_info(str(data["message"]))
+        if not structured:
+            print_success(f"Starting {target}")
+            if isinstance(data, dict) and data.get("message") and not args.wait:
+                print_info(str(data["message"]))
 
     if not args.wait:
         print_info("Machines take 2–5 minutes to come up.")
@@ -1531,14 +1783,19 @@ def cmd_lab_launch(api: HackSmarterAPI, config: Config, args) -> int:
     # time, with one permanent line printed per *change* of state. Polling
     # noise stays on the spinner; what you scroll back to afterwards is the
     # three or four lines that actually happened.
+    import contextlib
     started = time.monotonic()
     deadline = started + args.timeout
     last_heartbeat = 0.0
     last_state = None
     machines = []
-    console.print()
+    wrapper: Optional[Dict[str, Any]] = current
+    if not structured:
+        console.print()
 
-    with console.status("", spinner="dots") as spinner:
+    progress = (contextlib.nullcontext() if structured
+                else console.status("", spinner="dots"))
+    with progress as spinner:
         while time.monotonic() < deadline:
             elapsed = time.monotonic() - started
             # A networks-lab target is a wrapper around several machines;
@@ -1547,6 +1804,7 @@ def cmd_lab_launch(api: HackSmarterAPI, config: Config, args) -> int:
             poll_error = ""
             try:
                 it = _lookup_target(api, course_id, system_id)
+                wrapper = it or wrapper
                 machines = _flatten_lab_items([it]) if it else []
                 state = _system_status(it) if it else "unknown"
                 ip = _system_ip(machines[0]) if len(machines) == 1 else ""
@@ -1557,19 +1815,21 @@ def cmd_lab_launch(api: HackSmarterAPI, config: Config, args) -> int:
                 state = "unreadable"; ip = ""; poll_error = str(e)
 
             if state != last_state:
-                line = Text(f"  {time.strftime('%H:%M:%S')}  ", style="dim")
-                line.append(_badge(state, STATE_STYLE))
-                if poll_error:
-                    line.append(f"  {poll_error}", style="dim")
-                elif ip:
-                    line.append("  ")
-                    line.append(ip, style="bold cyan")
-                elif len(machines) > 1:
-                    up = sum(1 for m in machines
-                             if _system_status(m) in RUNNING_STATES)
-                    line.append(f"  {up}/{len(machines)} machines up",
+                if not structured:
+                    line = Text(f"  {time.strftime('%H:%M:%S')}  ",
                                 style="dim")
-                console.print(line)
+                    line.append(_badge(state, STATE_STYLE))
+                    if poll_error:
+                        line.append(f"  {poll_error}", style="dim")
+                    elif ip:
+                        line.append("  ")
+                        line.append(ip, style="bold cyan")
+                    elif len(machines) > 1:
+                        up = sum(1 for m in machines
+                                 if _system_status(m) in RUNNING_STATES)
+                        line.append(f"  {up}/{len(machines)} machines up",
+                                    style="dim")
+                    console.print(line)
                 last_state = state
 
             if state in RUNNING_STATES:
@@ -1579,11 +1839,14 @@ def cmd_lab_launch(api: HackSmarterAPI, config: Config, args) -> int:
                 steps((_lab_cmd(args, "reset"), "re-provision it"),
                       (_lab_cmd(args, "status"), "look at the current state"),
                       to_stderr=True)
+                if structured:
+                    print_output(wrapper or {"state": state}, fmt)
                 return 1
 
-            spinner.update(status=Text(
-                f"  waiting for {target} — {human_state(state)}, "
-                f"{human_duration(elapsed)} elapsed", style="dim"))
+            if not structured:
+                spinner.update(status=Text(
+                    f"  waiting for {target} — {human_state(state)}, "
+                    f"{human_duration(elapsed)} elapsed", style="dim"))
 
             # Keep the session "warm" — the browser heartbeats every ~10s
             # while sitting on the /take page. Without it the server may
@@ -1599,6 +1862,10 @@ def cmd_lab_launch(api: HackSmarterAPI, config: Config, args) -> int:
 
     took = human_duration(time.monotonic() - started)
     if last_state in RUNNING_STATES:
+        if structured:
+            # The one document the wait was for: the final live state.
+            print_output(wrapper or machines, fmt)
+            return 0
         if len(machines) > 1:
             print_success(f"{target} is up — all {len(machines)} machines "
                           f"({took})")
@@ -1618,7 +1885,10 @@ def cmd_lab_launch(api: HackSmarterAPI, config: Config, args) -> int:
     print_warning(f"Still {human_state(last_state or 'unknown')} after {took} "
                   f"— giving up on the wait, not on the machine.")
     steps((_lab_cmd(args, "status"), "check again in a minute"),
-          (f"{_lab_cmd(args, 'launch')} --timeout 900", "wait longer next time"))
+          (f"{_lab_cmd(args, 'launch')} --timeout 900", "wait longer next time"),
+          to_stderr=True)
+    if structured:
+        print_output(wrapper or {"state": last_state or "unknown"}, fmt)
     return 2
 
 
@@ -1682,21 +1952,18 @@ def cmd_lab_reset(api: HackSmarterAPI, config: Config, args) -> int:
     data = api.reset_system(course_id, system_id)
     if fmt in ("json", "yaml"):
         print_output(data, fmt); return 0
-    print_success(f"Resetting {label} — it comes back on a new IP.")
-    # Follow up with the fresh status so the user sees the new IP without
-    # a second command. Reset re-provisions, so the address changes.
+    print_success(f"Reset requested for {label} — it comes back on a new IP.")
+    # Show where things stand, honestly labelled: a status read this soon
+    # after the POST usually still shows the old machine (and its old IP),
+    # so don't present it as the post-reset state.
     try:
         items = _extract_items(api.get_lab_systems(course_id, [system_id]))
         if items:
             _render_systems_table(_flatten_lab_items(items),
-                                  title="Post-reset status")
-            new_ip = _system_ip(items[0])
-            if new_ip:
-                t = Text("new IP: ")
-                t.append(new_ip, style="bold cyan")
-                print_info(t)
+                                  title="Status (may still show the old "
+                                        "machine)")
     except Exception as e:
-        print_warning(f"Couldn't read the post-reset status: {e}")
+        print_warning(f"Couldn't read the current status: {e}")
     steps((_lab_cmd(args, "status"), "the new IP appears once it's back up"))
     return 0
 
@@ -1960,15 +2227,17 @@ def _cmd_lab_launch_aws(api: HackSmarterAPI, config: Config, args,
               (_lab_cmd(args, "reset"), "start over with fresh keys"))
         return 0
 
+    structured = fmt in ("json", "yaml")
     inputs = _aws_inputs(lab, args)
     if inputs.get("allowed_ip"):
-        note = ("" if getattr(args, "allowed_ip", None)
+        hint = ("" if getattr(args, "allowed_ip", None)
                 else "  (as HackSmarter sees you — override with --allowed-ip)")
-        print_info(f"Locking the lab to {inputs['allowed_ip']}{note}")
+        msg = f"Locking the lab to {inputs['allowed_ip']}{hint}"
+        info_err(msg) if structured else print_info(msg)
 
     data = api.aws_lab_power(course_id, lab_id, "start", inputs)
     if not args.wait:
-        if fmt in ("json", "yaml"):
+        if structured:
             print_output(data, fmt)
             return 0
         print_success(f"Building {label}")
@@ -1976,13 +2245,18 @@ def _cmd_lab_launch_aws(api: HackSmarterAPI, config: Config, args,
         steps((_lab_cmd(args, "status"), "check whether it's ready"))
         return 0
 
-    print_success(f"Building {label}")
+    import contextlib
+    if not structured:
+        print_success(f"Building {label}")
     started = time.monotonic()
     deadline = started + args.timeout
     last_state = _aws_state(lab)
-    console.print()
+    if not structured:
+        console.print()
 
-    with console.status("", spinner="dots") as spinner:
+    progress = (contextlib.nullcontext() if structured
+                else console.status("", spinner="dots"))
+    with progress as spinner:
         while time.monotonic() < deadline:
             try:
                 lab = {**api.get_aws_lab(course_id, lab_id), "aws_lab_id": lab_id}
@@ -1993,22 +2267,24 @@ def _cmd_lab_launch_aws(api: HackSmarterAPI, config: Config, args,
                 state = "unreadable"
 
             if state != last_state:
-                line = Text(f"  {time.strftime('%H:%M:%S')}  ", style="dim")
-                line.append(_badge(state, STATE_STYLE))
-                console.print(line)
+                if not structured:
+                    line = Text(f"  {time.strftime('%H:%M:%S')}  ", style="dim")
+                    line.append(_badge(state, STATE_STYLE))
+                    console.print(line)
                 last_state = state
 
             if state in AWS_READY_STATES or state in AWS_FAILED_STATES:
                 break
 
-            spinner.update(status=Text(
-                f"  terraform is applying — {human_duration(time.monotonic() - started)}"
-                f" elapsed", style="dim"))
+            if not structured:
+                spinner.update(status=Text(
+                    f"  terraform is applying — {human_duration(time.monotonic() - started)}"
+                    f" elapsed", style="dim"))
             time.sleep(5)
 
     took = human_duration(time.monotonic() - started)
     if last_state in AWS_READY_STATES:
-        if fmt in ("json", "yaml"):
+        if structured:
             print_output(lab, fmt)
             return 0
         print_success(f"{label} is ready  ({took})")
@@ -2022,11 +2298,16 @@ def _cmd_lab_launch_aws(api: HackSmarterAPI, config: Config, args,
         if lab.get("error_message"):
             print_warning(str(lab["error_message"]))
         steps((_lab_cmd(args, "launch"), "try again"), to_stderr=True)
+        if structured:
+            print_output(lab, fmt)
         return 1
 
     print_warning(f"Still {human_state(last_state)} after {took} — giving up on "
                   f"the wait, not on the lab.")
-    steps((_lab_cmd(args, "status"), "check again in a minute"))
+    steps((_lab_cmd(args, "status"), "check again in a minute"),
+          to_stderr=True)
+    if structured:
+        print_output(lab, fmt)
     return 2
 
 
@@ -2367,8 +2648,47 @@ def _vpn_filename(label: str) -> str:
     return f"{slugify(label, fallback='hsm-lab')}.ovpn"
 
 
+def _confirm_overwrite(dest: str, force: bool) -> bool:
+    """True if it's OK to write ``dest``.
+
+    An existing file is only replaced when --force says so or a person at
+    a terminal confirms; a script that didn't pass --force gets a clean
+    refusal instead of a silently clobbered download. The prompt lives on
+    stderr so it can't leak into redirected output.
+    """
+    import os
+    if force or not os.path.exists(dest):
+        return True
+    if sys.stdin.isatty() and sys.stderr.isatty():
+        # Text(), not an f-string: rich would eat the [y/N] hint as markup,
+        # and a path containing brackets would crash the prompt outright.
+        err_console.print(Text(f"{dest} exists — overwrite? [y/N] "), end="")
+        try:
+            answer = input()
+        except EOFError:
+            answer = ""
+        if answer.strip().lower() in ("y", "yes"):
+            return True
+        print_error(f"Left {dest} alone.")
+        return False
+    print_error(f"{dest} already exists — pass --force to overwrite it.")
+    return False
+
+
 def cmd_lab_vpn(api: HackSmarterAPI, config: Config, args) -> int:
     course_id, label = _resolve_lab(api, args)
+    if args.print:
+        # `--print > lab.ovpn` must produce a working profile, so stdout
+        # carries the profile and nothing else; the confirmation goes to
+        # stderr, and no file is written unless -o asks for one.
+        dest = args.output
+        if dest and not _confirm_overwrite(dest, getattr(args, "force", False)):
+            return 2
+        text = api.get_vpn_config(course_id, dest_path=dest)
+        print(text)
+        info_err(f"VPN profile for {label}"
+                 + (f" → also written to {dest}" if dest else ""))
+        return 0
     dest = args.output
     if not dest:
         # Named after the lab, not its UUID: this file gets passed to
@@ -2376,13 +2696,12 @@ def cmd_lab_vpn(api: HackSmarterAPI, config: Config, args) -> int:
         # and `hsm-bb164cba-ddc9-4cb0-8e95-ad4853d0143c.ovpn` is unusable
         # for either.
         dest = _vpn_filename(label)
-    text = api.get_vpn_config(course_id, dest_path=dest)
+    if not _confirm_overwrite(dest, getattr(args, "force", False)):
+        return 2
+    api.get_vpn_config(course_id, dest_path=dest)
     print_success(f"VPN profile for {label} → {dest}")
-    if args.print:
-        print(text)
-    else:
-        steps((f"sudo openvpn {dest}", "connect (keep it running)"),
-              (_lab_cmd(args, "status"), "check the machine is up"))
+    steps((f"sudo openvpn {dest}", "connect (keep it running)"),
+          (_lab_cmd(args, "status"), "check the machine is up"))
     return 0
 
 
@@ -2408,9 +2727,18 @@ def cmd_lab_image(api: HackSmarterAPI, config: Config, args) -> int:
     if args.url_only:
         print(api.image_url(image_path))
         return 0
+    # With -o the destination is known up front — refuse before spending
+    # the download. Without it the extension comes from the bytes, so the
+    # check can only happen after.
+    if args.output and not _confirm_overwrite(args.output,
+                                              getattr(args, "force", False)):
+        return 2
     data = api.download_lab_image(image_path)
     dest = args.output or f"{slugify(label, fallback=f'hsm-{course_id}')}" \
                           f"{_guess_image_ext(data)}"
+    if not args.output and not _confirm_overwrite(dest,
+                                                  getattr(args, "force", False)):
+        return 2
     with open(dest, "wb") as f:
         f.write(data)
     print_success(f"Thumbnail for {label} → {dest} ({len(data):,} bytes)")
@@ -2495,6 +2823,8 @@ def cmd_lab_certificate(api: HackSmarterAPI, config: Config, args) -> int:
 
     dest = args.output or (f"{slugify(label, fallback=f'hsm-{course_id}')}"
                            f"-certificate.pdf")
+    if not _confirm_overwrite(dest, getattr(args, "force", False)):
+        return 2
     data = api.download_certificate(completion_id, dest_path=dest)
     print_success(f"Certificate for {label} → {dest} ({len(data):,} bytes)")
     print_info(f"Shareable page: {completion_url}")
@@ -2533,6 +2863,9 @@ def _explain_error(exc: Exception, args) -> int:
     Exit codes are unchanged from the typed-error release: 2 for "you asked
     for something that doesn't exist / isn't allowed yet", 1 for "it broke".
     """
+    if isinstance(exc, BrokenPipeError):
+        raise exc  # main() handles it quietly — this is not an API failure
+
     identifier = getattr(args, "identifier", None)
     lab = quote_arg(identifier) if identifier else "<lab>"
     detail = exc.server_message() if isinstance(exc, HttpError) else ""
@@ -2540,10 +2873,9 @@ def _explain_error(exc: Exception, args) -> int:
     if isinstance(exc, AuthError):
         print_error("HackSmarter rejected your session — the cookie is "
                     "missing or expired.")
-        steps(("hsmcli config set-cookie '<paste Cookie header>'",
-               "devtools → Network → any request → Cookie"),
+        steps(("hsmcli auth login", "sign in again (hidden cookie prompt)"),
               ("hsmcli whoami", "check it worked"),
-              header="Log in again at https://www.hacksmarter.org, then:",
+              header="Log in again in your browser, then:",
               to_stderr=True)
         return 1
 
@@ -2616,7 +2948,7 @@ def _welcome(config: Config) -> int:
     # Someone who has already pasted a cookie doesn't need step 1 — the
     # welcome screen is also what `hsmcli` alone prints on the hundredth run.
     steps(
-        ("hsmcli config set-cookie '<cookie>'", "1 · sign in") if not signed_in else None,
+        ("hsmcli auth login", "1 · sign in") if not signed_in else None,
         ("hsmcli labs list", "find a lab"),
         ("hsmcli lab <name> launch", "start it"),
         ("hsmcli lab <name> vpn", "get on the lab network"),
@@ -2706,6 +3038,18 @@ def _add_format_flags(p):
     g.add_argument("--yaml", action="store_true", help="output YAML")
 
 
+def _positive_int(value: str) -> int:
+    """argparse type for --timeout: ``--timeout 0`` never polls and then
+    reports "still unknown after 0s", which reads as a launch failure."""
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a number")
+    if n <= 0:
+        raise argparse.ArgumentTypeError("must be a positive number of seconds")
+    return n
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="hsmcli",
@@ -2723,15 +3067,44 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--config-dir", help="override config directory (default ~/.hsmcli)")
     sp = p.add_subparsers(dest="command", metavar="COMMAND")
 
+    # auth
+    pa = sp.add_parser("auth", help="sign in and manage the session")
+    asub = pa.add_subparsers(dest="subcommand")
+    _al = asub.add_parser(
+        "login",
+        help="guided secure cookie import — opens the site, then a hidden "
+             "verified Cookie prompt (you still copy it from devtools)")
+    _al.add_argument("--github", action="store_true",
+                     help="point the guidance at the site's "
+                          "Sign-in-with-GitHub button (does not start an "
+                          "OAuth flow itself; the imported session is the "
+                          "same either way)")
+    _al.add_argument("--no-browser", action="store_true",
+                     help="don't open a browser (e.g. over SSH) — just show "
+                          "the instructions and prompt")
+    _ic = asub.add_parser(
+        "import-cookie",
+        help="save a Cookie header non-interactively ('-' or no argument "
+             "reads stdin)")
+    _ic.add_argument("cookie", nargs="?", default=None)
+    _ast = asub.add_parser("status", help="who's signed in, and for how long")
+    _add_format_flags(_ast)
+    asub.add_parser("logout", help="remove the stored session")
+
     # config
     pc = sp.add_parser("config", help="manage configuration")
     csub = pc.add_subparsers(dest="subcommand")
     csub.add_parser("show", help="show current config")
-    _sc = csub.add_parser("set-cookie", help="save the browser Cookie header (or '-' for stdin)")
+    _sc = csub.add_parser(
+        "set-cookie",
+        help="deprecated — use `auth login` / `auth import-cookie`")
     _sc.add_argument("cookie")
     csub.add_parser("clear-cookie", help="remove stored cookie")
     _sbu = csub.add_parser("set-base-url", help="override API base URL")
     _sbu.add_argument("url")
+    _sbu.add_argument("--allow-insecure-http", action="store_true",
+                      help="permit an http:// URL — the session cookie will "
+                           "travel unencrypted (local development only)")
     _sf = csub.add_parser("set-format", help="default output format")
     _sf.add_argument("format", choices=["table", "json", "yaml"])
     csub.add_parser("reset", help="wipe all config")
@@ -2824,7 +3197,7 @@ def build_parser() -> argparse.ArgumentParser:
     _lch.add_argument("--no-wait", dest="wait", action="store_false",
                       default=True,
                       help="don't poll after launch — return as soon as /power ACKs")
-    _lch.add_argument("--timeout", type=int, default=420,
+    _lch.add_argument("--timeout", type=_positive_int, default=420,
                       help="max seconds to wait when polling (default 420 = 7 min)")
     _add_aws_input_flags(_lch)
     _add_format_flags(_lch)
@@ -2854,13 +3227,19 @@ def build_parser() -> argparse.ArgumentParser:
     _add_format_flags(_lex)
 
     _lvpn = lsub2.add_parser("vpn", help="download the OpenVPN config for the lab")
-    _lvpn.add_argument("-o", "--output", help="output file (default ./hsm-<id>.ovpn)")
-    _lvpn.add_argument("--print", action="store_true", help="also print config to stdout")
+    _lvpn.add_argument("-o", "--output", help="output file (default ./<lab>.ovpn)")
+    _lvpn.add_argument("--print", action="store_true",
+                       help="print the profile to stdout instead of writing "
+                            "a file (combine with -o to also write one)")
+    _lvpn.add_argument("--force", action="store_true",
+                       help="overwrite an existing file without asking")
 
     _limg = lsub2.add_parser("image", help="download the lab's thumbnail image")
-    _limg.add_argument("-o", "--output", help="output file (default ./hsm-<id>.<ext>)")
+    _limg.add_argument("-o", "--output", help="output file (default ./<lab>.<ext>)")
     _limg.add_argument("--url-only", action="store_true",
                        help="just print the image URL, don't download")
+    _limg.add_argument("--force", action="store_true",
+                       help="overwrite an existing file without asking")
 
     _lcert = lsub2.add_parser(
         "certificate",
@@ -2870,6 +3249,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="output file (default ./<lab>-certificate.pdf)")
     _lcert.add_argument("--url-only", action="store_true",
                         help="print the one-hour signed download URL, don't save")
+    _lcert.add_argument("--force", action="store_true",
+                        help="overwrite an existing file without asking")
     _add_format_flags(_lcert)
 
     _lfl = lsub2.add_parser("flags", help="list flags / questions in the lab")
@@ -2912,9 +3293,20 @@ def main() -> int:
     except KeyboardInterrupt:
         # Ctrl-C during a launch poll is normal — the machine keeps booting.
         # A traceback here reads as a crash and buries that.
-        console.print()
+        err_console.print()
         print_warning("Interrupted. Anything already started keeps running.")
         return 130
+    except BrokenPipeError:
+        # `hsmcli … | head` closing the pipe early is normal Unix, not an
+        # error. Point stdout at devnull so the interpreter's shutdown
+        # flush doesn't print "Exception ignored" either; 141 = 128+SIGPIPE,
+        # what the shell would report had the default handler run.
+        import os
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except OSError:
+            pass
+        return 141
 
 
 def _run() -> int:
@@ -2931,7 +3323,22 @@ def _run() -> int:
     if not args.command:
         return _welcome(config)
 
-    # Config subcommands don't need an authenticated API client.
+    # Auth and config subcommands don't need an authenticated API client.
+    if args.command == "auth":
+        table = {
+            "login": cmd_auth_login,
+            "import-cookie": cmd_auth_import_cookie,
+            "status": cmd_auth_status,
+            "logout": cmd_auth_logout,
+        }
+        fn = table.get(args.subcommand)
+        if not fn:
+            return _need_subcommand("auth", table)
+        try:
+            return fn(config, args)
+        except Exception as e:
+            return _explain_error(e, args)
+
     if args.command == "config":
         table = {
             "show": cmd_config_show,
@@ -2954,9 +3361,9 @@ def _run() -> int:
     # there's nothing to fail yet if you've never signed in.
     if not config.get_cookie():
         print_error("You're not signed in yet.")
-        steps(("hsmcli config set-cookie '<paste Cookie header>'",
-               "devtools → Network → any request → Cookie"),
-              header="Log in at https://www.hacksmarter.org, then:",
+        steps(("hsmcli auth login", "sign in (hidden cookie prompt)"),
+              header=f"Log in at {config.get_base_url()} in your browser, "
+                     f"then:",
               to_stderr=True)
         return 1
 
@@ -3086,8 +3493,11 @@ def _run() -> int:
     except Exception as e:
         return _explain_error(e, args)
 
-    parser.print_help()
-    return 0
+    # Unreachable while every subparser above is dispatched — but if a
+    # command is ever added without wiring, "printed help, exited 0" is
+    # exactly the dishonest-success shape 0.2.0 fixed elsewhere.
+    print_error(f"`{args.command}` is not wired up — this is an hsmcli bug.")
+    return 2
 
 
 if __name__ == "__main__":

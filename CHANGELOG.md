@@ -4,9 +4,95 @@ All notable changes to this project. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning is
 [semver](https://semver.org/), pre-1.0 (minor bumps may break behaviour).
 
-## [Unreleased]
+## [0.3.0] — 2026-08-31
 
 ### Added
+
+- **`hsmcli auth` — signing in is a first-class command, not a config
+  key.** `auth login` is a *guided secure cookie import*: it opens the
+  browser at HackSmarter (sign in with email or the GitHub button —
+  `--github` points the guidance at it without starting an OAuth flow;
+  the imported session is identical), then takes the `Cookie:` header
+  behind a *hidden* prompt, so the token stays out of shell history,
+  scrollback and `ps`. Only the Supabase auth chunks
+  (`sb-auth-auth-token.N`, matched exactly) are stored — a header without
+  them is rejected, and the candidate is verified against the API *before*
+  it replaces the stored session, so a bad paste can't clobber a working
+  login. hsmcli does not refresh the token; renewal is re-running
+  `auth login`. `auth import-cookie -` is the
+  piped fallback for scripts and secret managers; `auth status` reports
+  who/until-when/stored-where (exit 1 when signed out, expired, or the
+  stored cookie doesn't decode to a session);
+  `auth logout` removes the stored session and warns if `$HSMCLI_COOKIE`
+  still overrides it. `config set-cookie` remains as a deprecated alias.
+  A real PKCE/device-code flow needs an endpoint HackSmarter would have to
+  provide; until then the browser does the OAuth dance and hsmcli takes
+  the session it produced — it never sees a password.
+- **Overwrite protection on downloads.** `vpn`, `image` and `certificate`
+  no longer clobber an existing file: at a terminal they ask, in a script
+  they refuse (exit 2) unless `--force` is passed.
+- `--debug` masks credential-bearing response fields (IAM secret keys,
+  signed URLs, tokens) so a trace is safe to paste into a bug report;
+  `HSMCLI_DEBUG_RAW=1` restores the unredacted payload.
+- An autouse test fixture blocks real sockets, so a stray unmocked request
+  in a future test fails instead of hanging CI.
+
+### Changed
+
+- **Structured output is now a contract.** `--json`/`--yaml` emit exactly
+  one document on stdout; warnings, progress and next-step hints go to
+  stderr everywhere (previously warnings and the launch-timeout prose
+  landed on stdout, corrupting `--json > out.json`). `launch --json`
+  honours `--wait` (the default) and emits the *final* live state — IP
+  included — instead of returning the power-on ACK early; `--no-wait`
+  emits the ACK. `whoami --json` exits 1 when the session is missing or
+  the profile fetch failed, instead of embedding the error and exiting 0.
+- **`vpn --print` prints only the profile on stdout** (confirmation moves
+  to stderr), so `vpn --print > lab.ovpn` produces a working profile; it
+  no longer also writes the default file unless `-o` asks.
+- `reset` labels the immediate follow-up read honestly ("may still show
+  the old machine") instead of presenting the pre-reset address as the
+  "new IP".
+- `config set-base-url` requires `https://` — an `http://` URL would send
+  the whole Supabase session in cleartext. `--allow-insecure-http` exists
+  for local development; URLs with embedded credentials or no hostname are
+  rejected outright. With a loopback base URL the stored session is scoped
+  to that host (it stays pinned to `.hacksmarter.org` for everything else,
+  so a hostile base URL still can't exfiltrate it).
+- Broken pipes (`hsmcli … | head`) exit 141 silently instead of reporting
+  "[Errno 32] Broken pipe" as an API failure.
+- `launch --timeout` rejects zero and negative values.
+
+### Fixed
+
+- **No API request could time out** — `requests` defaults to waiting
+  forever, so a stalled server hung the CLI (behind a live spinner, during
+  `launch --wait`). Every call now carries a connect/read timeout
+  (5s/30s; 120s read for downloads).
+- **VPN profiles were written world-readable.** They embed the client's
+  private key; they're now created `0600` like the config file.
+- `--config-dir` pointed at a pre-existing directory no longer chmods it
+  to 0700 — tightening is reserved for directories hsmcli created and for
+  the default `~/.hsmcli`. (A shared directory, or `/tmp`, could be
+  silently privatised before.)
+- Config writes are atomic (temp file + rename), so an interrupted write
+  can't truncate the stored session; a corrupt config file now says so on
+  stderr instead of silently signing you out.
+- The release workflow no longer interpolates the dispatch input into
+  shell code (textbook injection, even if only maintainers could reach
+  it), and validates it against a version pattern.
+
+### Packaging
+
+- License metadata migrated to PEP 639 (`license = "MIT"` +
+  `license-files`); the deprecated table form and classifier were on
+  setuptools' removal path and would eventually have broken the release
+  build.
+- The AKIA-shaped AWS key id in a test fixture was replaced with AWS's
+  documented placeholder, so secret scanners don't flag the first public
+  push.
+
+### Added (earlier in the 0.3.0 cycle)
 
 - **`labs list -T/--topic` — the website's subject filter.** The catalog
   page's chips (AWS, Web, Windows, Linux, Active Directory, Blue Team,

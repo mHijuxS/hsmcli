@@ -86,7 +86,10 @@ def fail(msg: Any) -> None:
 
 
 def warn(msg: Any) -> None:
-    _emit(console, "⚠", "warn", msg)
+    # stderr, like fail: a warning is a diagnostic, and the ones that fire
+    # mid-pipe (launch timeout, "no credentials yet", Ctrl-C) were
+    # corrupting `hsmcli … --json > out.json`.
+    _emit(err_console, "⚠", "warn", msg)
 
 
 def info(msg: Any) -> None:

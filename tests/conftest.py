@@ -4,7 +4,29 @@ The values are trimmed to the fields hsmcli actually reads, with ids and
 names replaced by fakes — these are shape fixtures, not account data.
 """
 
+import socket
+
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def _no_network(monkeypatch):
+    """Fail fast if a test ever reaches for a real socket.
+
+    Every test mocks at the requests/session layer; a stray unmocked call
+    used to *hang* CI (no timeout reached the socket) rather than fail.
+    """
+    def _blocked(*args, **kwargs):
+        raise RuntimeError("test tried to open a network connection")
+
+    monkeypatch.setattr(socket.socket, "connect", _blocked)
+
+
+@pytest.fixture(autouse=True)
+def _no_env_cookie(monkeypatch):
+    """The developer's own $HSMCLI_COOKIE must not leak into assertions —
+    it overrides every Config the tests build."""
+    monkeypatch.delenv("HSMCLI_COOKIE", raising=False)
 
 
 # ── /api/student/catalog ──────────────────────────────────────────────────

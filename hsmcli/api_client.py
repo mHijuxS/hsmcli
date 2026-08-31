@@ -15,7 +15,7 @@ import os
 import re
 import sys
 from typing import Any, Dict, List, Optional
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 import requests
 
@@ -138,6 +138,13 @@ DEFAULT_USER_AGENT = (f"hsmcli/{client_version()} "
 # Lab/course thumbnails live on a separate CloudFront-backed CDN, keyed by
 # the course's `image_path` field — public, no auth/cookies required.
 IMAGE_BASE_URL = "https://images.coursestack.com"
+
+# (connect, read) timeouts. requests waits *forever* by default, and a
+# half-open connection mid-`launch --wait` hangs the CLI behind a spinner
+# with no way out but Ctrl-C. API calls answer in well under 30s or not at
+# all; downloads (VPN profile, certificate PDF) get longer to stream.
+DEFAULT_TIMEOUT = (5, 30)
+DOWNLOAD_TIMEOUT = (5, 120)
 
 # The actions the AWS-lab /power endpoint accepts (the server validates this
 # enum and rejects anything else with a 400).
@@ -271,11 +278,46 @@ class HackSmarterAPI:
         if cookie:
             parsed = parse_cookie_header(cookie)
             if parsed:
+                # Pinned to .hacksmarter.org so a hostile `set-base-url`
+                # can't exfiltrate the session to another host. The one
+                # exception is a loopback base URL (--allow-insecure-http
+                # local development): scoping to that host is harmless —
+                # localhost can't be someone else's server — and without
+                # it the stored session never reaches the dev server.
+                host = urlsplit(self.base_url).hostname or ""
+                if host in ("localhost", "127.0.0.1", "::1"):
+                    # cookiejar appends ".local" to dot-less request hosts
+                    # (eff_request_host), so the cookie's domain must match.
+                    domain = host if "." in host else host + ".local"
+                else:
+                    domain = COOKIE_DOMAIN
                 for name, value in parsed.items():
-                    self.session.cookies.set(name, value, domain=COOKIE_DOMAIN)
+                    self.session.cookies.set(name, value, domain=domain)
                 self._session_data = decode_supabase_session(parsed)
 
     # ── low-level ─────────────────────────────────────────────────────────
+
+    # Response fields whose values are credentials: IAM keys in
+    # terraform_outputs, signed download URLs, session material. --debug
+    # output is exactly what people paste into bug reports, so these are
+    # masked unless HSMCLI_DEBUG_RAW=1 asks for the real thing.
+    _SENSITIVE_KEY_RE = re.compile(
+        r"secret|token|password|access_key|private_key|authorization"
+        r"|signed_url|cookie|credential", re.I)
+
+    @classmethod
+    def _redact(cls, value: Any) -> Any:
+        # A sensitive key masks its whole value, containers included — a
+        # {"tokens": ["eyJ…"]} list holds the same secret its key names,
+        # and over-masking a debug trace beats leaking into a bug report.
+        if isinstance(value, dict):
+            return {k: ("«redacted»" if cls._SENSITIVE_KEY_RE.search(str(k))
+                        else cls._redact(v))
+                    for k, v in value.items()}
+        if isinstance(value, list):
+            return [cls._redact(v) for v in value]
+        return value
+
     def _trace(self, method: str, endpoint: str, response: Any,
                payload: Any = None, body: Optional[str] = None) -> None:
         """Print one request/response to stderr when ``--debug`` is on.
@@ -294,6 +336,8 @@ class HackSmarterAPI:
         if body is not None:
             print(body, file=sys.stderr)
         else:
+            if not os.getenv("HSMCLI_DEBUG_RAW"):
+                payload = self._redact(payload)
             print(json.dumps(payload, indent=2, ensure_ascii=False,
                              default=str), file=sys.stderr)
 
@@ -313,17 +357,22 @@ class HackSmarterAPI:
         url = urljoin(self.base_url + "/", endpoint.lstrip("/"))
         method_up = method.upper()
         try:
+            timeout = DOWNLOAD_TIMEOUT if stream else DEFAULT_TIMEOUT
             if method_up == "GET":
-                r = self.session.get(url, params=params, stream=stream)
+                r = self.session.get(url, params=params, stream=stream,
+                                     timeout=timeout)
             elif method_up == "POST":
                 if data is None:
-                    r = self.session.post(url, params=params, data=b"")
+                    r = self.session.post(url, params=params, data=b"",
+                                          timeout=timeout)
                 else:
-                    r = self.session.post(url, json=data, params=params)
+                    r = self.session.post(url, json=data, params=params,
+                                          timeout=timeout)
             elif method_up == "PUT":
-                r = self.session.put(url, json=data, params=params)
+                r = self.session.put(url, json=data, params=params,
+                                     timeout=timeout)
             elif method_up == "DELETE":
-                r = self.session.delete(url, params=params)
+                r = self.session.delete(url, params=params, timeout=timeout)
             else:
                 raise ValueError(f"Unsupported HTTP method: {method}")
             r.raise_for_status()
@@ -360,8 +409,8 @@ class HackSmarterAPI:
         if code == 401:
             raise AuthError(
                 f"HTTP 401 on {method_up} {endpoint}: {body}. "
-                f"Cookie may be expired — hsmcli config set-cookie "
-                f"'<paste cookie header>' or export HSMCLI_COOKIE.",
+                f"Cookie may be expired — hsmcli auth login, "
+                f"or export HSMCLI_COOKIE.",
                 status=status, endpoint=endpoint, body=body,
             )
         if code == 403:
@@ -438,7 +487,7 @@ class HackSmarterAPI:
         Returns the raw bytes; writes them to ``dest_path`` when provided.
         """
         url = self.image_url(image_path)
-        r = requests.get(url, stream=True)
+        r = requests.get(url, stream=True, timeout=DOWNLOAD_TIMEOUT)
         r.raise_for_status()
         content = r.content
         if dest_path:
@@ -690,9 +739,13 @@ class HackSmarterAPI:
         headers = {"Referer": referer}
         try:
             if body is None:
-                r = self.session.request(method, url, data=b"", headers=headers)
+                r = self.session.request(method, url, data=b"",
+                                         headers=headers,
+                                         timeout=DEFAULT_TIMEOUT)
             else:
-                r = self.session.request(method, url, json=body, headers=headers)
+                r = self.session.request(method, url, json=body,
+                                         headers=headers,
+                                         timeout=DEFAULT_TIMEOUT)
             r.raise_for_status()
         except requests.exceptions.HTTPError as e:
             self._raise_http_error(e, method.upper(), path)
@@ -944,8 +997,17 @@ class HackSmarterAPI:
         else:
             text = r.text
         if dest_path:
-            with open(dest_path, "w") as f:
+            # The profile embeds the client's private key — same treatment as
+            # the cookie file: created 0600 outright, never briefly readable
+            # (the mode is ignored for an existing file, hence the chmod).
+            fd = os.open(dest_path,
+                         os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
                 f.write(text)
+            try:
+                os.chmod(dest_path, 0o600)
+            except OSError:
+                pass
         return text
 
     # ── content / heartbeat ───────────────────────────────────────────────
@@ -1123,7 +1185,7 @@ class HackSmarterAPI:
         Writes to ``dest_path`` when given, and always returns the bytes.
         """
         url = self.certificate_download_url(completion_id)
-        r = requests.get(url, stream=True)
+        r = requests.get(url, stream=True, timeout=DOWNLOAD_TIMEOUT)
         r.raise_for_status()
         content = r.content
         if dest_path:

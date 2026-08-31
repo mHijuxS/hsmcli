@@ -156,7 +156,7 @@ def test_401_explains_how_to_sign_in_again(capsys):
     rc = _explain_error(AuthError("HTTP 401 …", status=401), _args())
     err = capsys.readouterr().err
     assert rc == 1
-    assert "set-cookie" in err
+    assert "auth login" in err
 
 
 def test_a_rejected_request_reports_the_server_reason(capsys):

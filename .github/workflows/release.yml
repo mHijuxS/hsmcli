@@ -30,10 +30,20 @@ jobs:
           python-version: "3.x"
 
       - name: Check the tag matches pyproject
+        # The input goes through env, never interpolated into the script —
+        # `${{ }}` inside `run:` is textbook shell injection, even when only
+        # dispatch-capable users can reach it.
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
         run: |
+          case "$REQUESTED_VERSION" in
+            *[!0-9a-zA-Z.-]*|"")
+              echo "'$REQUESTED_VERSION' doesn't look like a version" >&2
+              exit 1;;
+          esac
           declared=$(python -c "import tomllib,pathlib; print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
-          if [ "$declared" != "${{ inputs.version }}" ]; then
-            echo "pyproject says $declared, you asked for ${{ inputs.version }}" >&2
+          if [ "$declared" != "$REQUESTED_VERSION" ]; then
+            echo "pyproject says $declared, you asked for $REQUESTED_VERSION" >&2
             exit 1
           fi
           echo "version $declared"
