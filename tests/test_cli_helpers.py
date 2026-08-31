@@ -4,6 +4,8 @@ import pytest
 
 from hsmcli.cli import (
     _aws_env_exports,
+    _aws_env_map,
+    _creds_body,
     _drop_writeups,
     _md_sections,
     _objective_scope,
@@ -289,6 +291,65 @@ def test_aws_env_exports_quotes_shell_metacharacters():
 
 def test_aws_env_exports_skips_nested_and_null_values():
     assert _aws_env_exports({"a": {"n": 1}, "b": [1], "c": None}) == []
+
+
+def test_aws_env_exports_reads_prefixed_cloudgoat_keys():
+    """CloudGoat names its outputs after the scenario and the IAM user it
+    minted, so the suffix is the only part that says what the value is."""
+    lines = _aws_env_exports({
+        "cloudgoat_output_chris_access_key_id": "AKIAEXAMPLE",
+        "cloudgoat_output_chris_secret_key": "s3cr3t",
+    })
+    assert lines == [
+        "export AWS_ACCESS_KEY_ID=AKIAEXAMPLE",
+        "export AWS_SECRET_ACCESS_KEY=s3cr3t",
+    ]
+
+
+def test_aws_env_exports_reads_secret_access_key_suffix():
+    """`..._secret_access_key` ends with `_access_key` too — longest wins."""
+    assert _aws_env_exports({"lab_chris_secret_access_key": "s"}) == [
+        "export AWS_SECRET_ACCESS_KEY=s"]
+
+
+def test_aws_env_exports_leaves_contested_vars_unset():
+    """Two IAM users both claim AWS_ACCESS_KEY_ID. Choosing one risks
+    pairing one user's key id with another's secret, so neither wins."""
+    lines = _aws_env_exports({
+        "cg_chris_access_key_id": "AKIA1",
+        "cg_chris_secret_key": "s1",
+        "cg_bob_access_key_id": "AKIA2",
+        "cg_bob_secret_key": "s2",
+        "cg_region": "us-east-1",
+    })
+    assert not any(line.startswith("export AWS_ACCESS_KEY_ID=") for line in lines)
+    assert "export HSM_CG_CHRIS_ACCESS_KEY_ID=AKIA1" in lines
+    assert "export AWS_DEFAULT_REGION=us-east-1" in lines
+    contested = _aws_env_map({
+        "cg_chris_access_key_id": "AKIA1", "cg_bob_access_key_id": "AKIA2"})[1]
+    assert contested == {"AWS_ACCESS_KEY_ID": ["cg_chris_access_key_id",
+                                               "cg_bob_access_key_id"]}
+
+
+# ── the credentials panel ─────────────────────────────────────────────────
+
+def _rendered(outputs, width):
+    from rich.console import Console
+    buf = Console(width=width, no_color=True, highlight=False, record=True)
+    buf.print(_creds_body(outputs))
+    return buf.export_text()
+
+
+def test_creds_body_keeps_every_secret_whole():
+    """A truncated secret is worse than an ugly one: it looks like a key
+    and fails like a typo."""
+    outputs = {"cloudgoat_output_chris_secret_key": "X" * 40,
+               "cloudgoat_output_chris_access_key_id": "AKIAWXB5ELPOR2QGLBHI"}
+    for width in (60, 76, 100, 200):
+        text = _rendered(outputs, width)
+        assert "…" not in text
+        assert "X" * 40 in text
+        assert "cloudgoat output chris access key id" in text
 
 
 # ── --input KEY=VALUE ─────────────────────────────────────────────────────

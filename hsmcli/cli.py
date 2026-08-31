@@ -1769,6 +1769,47 @@ def _render_aws_table(labs: List[Dict[str, Any]], title: str = "AWS labs"):
     console.print(t)
 
 
+def _aws_env_var(key: str) -> Optional[str]:
+    """The AWS env var a terraform output feeds, or None.
+
+    Labs rarely name an output plain ``access_key``. CloudGoat scenarios
+    prefix theirs with the scenario and the IAM user they minted
+    (``cloudgoat_output_chris_secret_key``), so an exact-match table
+    exports nothing the aws CLI reads. The suffix carries the meaning —
+    tried longest first, so ``secret_access_key`` isn't mistaken for an
+    ``access_key``.
+    """
+    k = str(key).lower().strip("_")
+    if k in _AWS_ENV_KEYS:
+        return _AWS_ENV_KEYS[k]
+    for suffix in sorted(_AWS_ENV_KEYS, key=len, reverse=True):
+        if k.endswith("_" + suffix):
+            return _AWS_ENV_KEYS[suffix]
+    return None
+
+
+def _aws_env_map(outputs: Dict[str, Any]) -> Tuple[Dict[str, str],
+                                                   Dict[str, List[str]]]:
+    """Split the outputs into ``{key: env var}`` and the contested ones.
+
+    A scenario that mints two IAM users hands back two outputs claiming
+    ``AWS_ACCESS_KEY_ID``. Picking one would be a guess, and the guess
+    that goes wrong pairs one user's key id with another's secret — a
+    credential that fails in a way that looks like the lab is broken. So
+    a contested env var is claimed by nobody, and the caller can say why.
+    """
+    claims: Dict[str, List[str]] = {}
+    for k, v in outputs.items():
+        if isinstance(v, (dict, list)) or v is None:
+            continue
+        env = _aws_env_var(k)
+        if env:
+            claims.setdefault(env, []).append(str(k))
+    resolved = {keys[0]: env for env, keys in claims.items() if len(keys) == 1}
+    contested = {env: keys for env, keys in claims.items() if len(keys) > 1}
+    return resolved, contested
+
+
 def _aws_env_exports(outputs: Dict[str, Any]) -> List[str]:
     """``export FOO=bar`` lines for a lab's terraform outputs.
 
@@ -1776,15 +1817,48 @@ def _aws_env_exports(outputs: Dict[str, Any]) -> List[str]:
     make the aws CLI work; anything else is passed through as
     ``HSM_<KEY>`` rather than dropped.
     """
+    resolved, _ = _aws_env_map(outputs)
     lines: List[str] = []
     for k, v in outputs.items():
         if isinstance(v, (dict, list)) or v is None:
             continue
-        env = _AWS_ENV_KEYS.get(str(k).lower())
+        env = resolved.get(str(k))
         if not env:
             env = "HSM_" + re.sub(r"[^A-Z0-9]+", "_", str(k).upper()).strip("_")
         lines.append(f"export {env}={shlex.quote(str(v))}")
     return lines
+
+
+def _creds_body(outputs: Dict[str, Any]):
+    """Lay the outputs out so no value is ever cut short.
+
+    Key beside value reads best, but these keys are long
+    (``cloudgoat_output_chris_secret_key``) and the values are secrets:
+    let rich shrink that layout and it ellipsises a key into a phantom
+    second row, or a secret into something that no longer works when it's
+    pasted. So the two columns are used only when both fit, and the
+    fallback stacks each value under its own key.
+    """
+    keys = [str(k).replace("_", " ") for k in outputs]
+    vals = [str(v) for v in outputs.values()]
+    # Panel borders (2) plus its padding (4), then the table's own cell
+    # padding (4) — what's left has to hold the widest key and value.
+    room = console.width - 6
+    if max(map(len, keys)) + max(map(len, vals)) + 8 <= room:
+        t = Table(show_header=False, border_style="dim", box=None,
+                  padding=(0, 2))
+        t.add_column("key", style="dim", no_wrap=True)
+        t.add_column("value", style="bold cyan", overflow="fold")
+        for k, v in zip(keys, vals):
+            t.add_row(Text(k), Text(v))
+        return t
+    body: List[Text] = []
+    for k, v in zip(keys, vals):
+        if body:
+            body.append(Text(""))
+        body.append(Text(k, style="dim"))
+        body.append(Text(v, style="bold cyan", overflow="fold"))
+    return Group(*body)
 
 
 def _render_aws_creds(lab: Dict[str, Any]) -> bool:
@@ -1792,18 +1866,13 @@ def _render_aws_creds(lab: Dict[str, Any]) -> bool:
     outputs = lab.get("terraform_outputs") or {}
     if not isinstance(outputs, dict) or not outputs:
         return False
-    t = Table(show_header=False, border_style="dim", box=None, padding=(0, 2))
-    t.add_column("key", style="dim")
-    t.add_column("value", style="bold cyan")
-    for k, v in outputs.items():
-        t.add_row(str(k).replace("_", " "), str(v))
     expires = str(lab.get("expires_at") or "")
     left = format_time_left(expires)
     title = f"Credentials — {lab.get('name') or lab.get('aws_lab_id')}"
     subtitle = None
     if expires:
         subtitle = f"expires {format_datetime(expires)}" + (f" ({left})" if left else "")
-    console.print(Panel(t, title=title, subtitle=subtitle,
+    console.print(Panel(_creds_body(outputs), title=title, subtitle=subtitle,
                         border_style="green", padding=(0, 2)))
     return True
 
@@ -2018,6 +2087,10 @@ def cmd_lab_creds(api: HackSmarterAPI, config: Config, args) -> int:
                         f"{human_state(_aws_state(lab))}.")
             steps((_lab_cmd(args, "launch"), "build it first"), to_stderr=True)
             return 1
+        for env, keys in _aws_env_map(outputs)[1].items():
+            info_err(f"{len(keys)} outputs could be {env} "
+                     f"({', '.join(sorted(keys))}) — exported as HSM_* "
+                     f"instead, so pick one and set {env} yourself.")
         for line in _aws_env_exports(outputs):
             print(line)
         return 0
