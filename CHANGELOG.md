@@ -6,6 +6,22 @@ All notable changes to this project. Format loosely follows
 
 ## [Unreleased]
 
+### Added
+
+- **`labs list -T/--topic` — the website's subject filter.** The catalog
+  page's chips (AWS, Web, Windows, Linux, Active Directory, Blue Team,
+  Guided Lab, Miscellaneous) are derived client-side from each card's
+  `subtitle`; there is no topic field in the API. `--topic` reimplements
+  that match verbatim — same keywords, same word-boundary rule, same
+  ordering — and was diffed against the page's own JS bundle over all 88
+  catalog items with zero divergence. Repeatable (`-T aws -T web` ORs),
+  and it accepts what people type: `ad`, `active directory`, `web app`,
+  `misc`, `guided`. Pairs with the existing `-d/--difficulty`, which the
+  page derives the same way from the `(Hard)` suffix.
+- A **Topic** column on `labs list` and a topic line on `lab <name> info`,
+  both shown only when there's more than one topic to distinguish.
+- `--sort topic`.
+
 ### Changed
 
 - **Output is written for a person now.** The API's internal vocabulary is

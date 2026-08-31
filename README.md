@@ -56,10 +56,12 @@ hsmcli labs list -c all                 # every category: + guided/range/hackwit
 hsmcli labs list -c range -c guided     # category filter (repeatable)
 hsmcli labs list -e                     # only /courses (the labs on your account)
 hsmcli labs list --catalog              # only /catalog (storefront cards, incl. bundles)
+hsmcli labs list -T ad                  # topic filter — the website's chips (repeatable)
+hsmcli labs list -T aws -T web -d easy  # topic + difficulty, as on the catalog page
 hsmcli labs list -d easy -d medium      # difficulty filter (repeatable)
 hsmcli labs list -t in_progress         # state filter
 hsmcli labs list -s "active directory"  # substring filter on name/description
-hsmcli labs list --sort difficulty      # sort by name | difficulty | state
+hsmcli labs list --sort difficulty      # sort by name | difficulty | state | topic
 
 # One lab — identifier comes first, then the action
 hsmcli lab <name> info                  # objective/scope + flags + live systems
@@ -177,6 +179,43 @@ thing, and lumping them in makes the list harder to scan. `-c all` widens
 to every category; `-c range -c guided` picks specific ones. The footer
 always names the active narrowing, so a filtered list never reads as
 complete.
+
+### Topics — the website's chips, reimplemented
+
+The catalog page filters by subject (AWS, Active Directory, Web, Windows,
+Linux, Blue Team, Guided Lab, Miscellaneous) and by difficulty. Neither is
+a field: **there is no topic or difficulty anywhere in the API payload**.
+The page derives both client-side — the topic by keyword-matching the
+card's `subtitle` ("This is a Medium Active Directory challenge lab."), the
+difficulty by reading the `(Hard)` suffix off the title.
+
+`-T/--topic` reimplements that match verbatim, down to the site's own
+word-boundary rule (`(^|[^a-z0-9])web([^a-z0-9]|$)`, which is why "Web App"
+matches `web` and "Webhooks" doesn't) and its ordering, so `-T ad` selects
+exactly what clicking the chip does. The port was diffed against the
+page's own JS bundle over all 88 catalog items — topics and difficulty —
+with zero divergence.
+
+Three details worth knowing, all inherited from the site:
+
+- **A lab can have several topics.** "Windows & Linux" and "Web and Linux"
+  match both chips, and the Topic column shows `Windows/Linux`.
+- **`miscellaneous` means "names no subject"**, not "other" — `Challenge
+  Lab: SQL Basics (Easy)` lands there because its subtitle says only "This
+  is an Easy challenge lab."
+- **`guided_lab` is matched on the title, not the subtitle**, because "This
+  is an Easy Guided Lab." names no subject. A guided lab that *does* name
+  one (`This is an Easy AWS Guided Lab.`) matches both `-T guided` and
+  `-T aws`.
+
+The flag takes what you'd actually type: `ad`, `active directory`,
+`active-directory` and `active_directory` are the same thing, as are
+`web`/`web app`, `misc`/`miscellaneous`, `guided`/`guided_lab`.
+
+This is orthogonal to `-c/--category`, which asks what *kind* of thing a
+lab is (challenge / guided / range / …) rather than what it's about. The
+Topic column only appears when a list actually spans more than one, so
+`-T ad` doesn't waste a column repeating "AD".
 
 ### `/catalog` is not the full list
 

@@ -5,7 +5,7 @@ Commands:
     hsmcli config set-cookie "<paste Cookie header>"
     hsmcli config show
     hsmcli whoami
-    hsmcli labs list [--search q] [--enrolled | --catalog]
+    hsmcli labs list [--search q] [--topic ad] [--difficulty hard]
     hsmcli lab <id-or-name> info [--briefing] [--writeups] [--bundles] [--all]
     hsmcli lab <id-or-name> enroll
     hsmcli lab <id-or-name> systems
@@ -379,6 +379,146 @@ def _extract_state(item: Dict[str, Any]) -> str:
     return ""
 
 
+def _item_subtitle(item: Dict[str, Any]) -> str:
+    """The one-line blurb the site derives lab topics from.
+
+    ``/catalog`` calls it ``subtitle``; ``/courses`` calls it
+    ``description`` (its long-form body lives under
+    ``description_markdown``). Merged items can carry either, and a
+    catalog card nests its copy under ``item``.
+    """
+    for k in ("subtitle", "description"):
+        v = item.get(k)
+        if isinstance(v, str) and v.strip():
+            return v
+    nested = item.get("item")
+    if isinstance(nested, dict):
+        for k in ("subtitle", "description"):
+            v = nested.get(k)
+            if isinstance(v, str) and v.strip():
+                return v
+    return ""
+
+
+# ── topics (the site's own "AWS / Active Directory / …" filter) ────────────
+# There is no topic field anywhere in the API: the catalog page derives the
+# chips client-side by keyword-matching the *subtitle* ("This is a Medium
+# Active Directory challenge lab."). These helpers reimplement that match
+# verbatim so `--topic ad` selects exactly what clicking the chip does.
+
+_TOPIC_WORD_CACHE: Dict[str, Any] = {}
+
+
+def _has_word(haystack: str, word: str) -> bool:
+    """The site's own word test: ``(^|[^a-z0-9])word([^a-z0-9]|$)``.
+
+    Deliberately not ``\b``: it means "Web App" matches ``web`` while
+    "Webhooks" doesn't, and it's what keeps our results identical to the
+    page's.
+    """
+    pat = _TOPIC_WORD_CACHE.get(word)
+    if pat is None:
+        pat = _TOPIC_WORD_CACHE[word] = _re.compile(
+            r"(^|[^a-z0-9])" + _re.escape(word) + r"([^a-z0-9]|$)", _re.I)
+    return bool(pat.search(haystack))
+
+
+def _lab_topics(item: Dict[str, Any]) -> List[str]:
+    """Every topic the subtitle names, in the site's own order.
+
+    A lab can carry several ("Windows & Linux", "Web and Linux"); one that
+    names none is "miscellaneous". ``guided_lab`` is *not* here — the site
+    keys that off the title, see ``_matches_topic``.
+    """
+    sub = (_item_subtitle(item) or "").lower()
+    if not sub:
+        return []
+    topics: List[str] = []
+    if _has_word(sub, "aws") or "amazon web services" in sub:
+        topics.append("aws")
+    if _has_word(sub, "web"):
+        topics.append("web")
+    if _has_word(sub, "windows"):
+        topics.append("windows")
+    if _has_word(sub, "linux"):
+        topics.append("linux")
+    if "active directory" in sub or "activedirectory" in sub:
+        topics.append("active_directory")
+    if _has_word(sub, "blue team") or _has_word(sub, "blueteam"):
+        topics.append("blue_team")
+    return topics
+
+
+def _matches_topic(item: Dict[str, Any], topic: str) -> bool:
+    """One item against one topic chip."""
+    if topic == "guided_lab":
+        # The odd one out: a title check, not a subtitle one, because
+        # "This is an Easy Guided Lab." says nothing about the subject.
+        return "guided lab" in (_item_name(item) or "").lower()
+    topics = _lab_topics(item)
+    if topic == "miscellaneous":
+        return not topics
+    return topic in topics
+
+
+TOPIC_LABELS = {
+    "aws": "AWS",
+    "web": "Web",
+    "windows": "Windows",
+    "linux": "Linux",
+    "active_directory": "Active Directory",
+    "blue_team": "Blue Team",
+    "guided_lab": "Guided Lab",
+    "miscellaneous": "Miscellaneous",
+}
+
+# The table is already four or five columns wide, and "Active Directory"
+# spelled out costs a sixth of an 80-column terminal on every AD row.
+_TOPIC_SHORT = dict(TOPIC_LABELS, active_directory="AD", miscellaneous="misc")
+
+
+def _topic_label(item: Dict[str, Any], short: bool = False) -> str:
+    labels = _TOPIC_SHORT if short else TOPIC_LABELS
+    topics = _lab_topics(item)
+    if not topics:
+        return labels["miscellaneous"]
+    return "/".join(labels[t] for t in topics)
+
+
+# What `--topic` accepts. The site's values are the canonical spellings;
+# the rest are what people actually type.
+_TOPIC_ALIASES = {
+    "all": "all",
+    "aws": "aws", "cloud": "aws", "amazon": "aws",
+    "web": "web", "webapp": "web", "web_app": "web",
+    "windows": "windows", "win": "windows",
+    "linux": "linux",
+    "active_directory": "active_directory", "activedirectory": "active_directory",
+    "ad": "active_directory",
+    "blue_team": "blue_team", "blueteam": "blue_team", "blue": "blue_team",
+    "guided_lab": "guided_lab", "guided": "guided_lab",
+    "miscellaneous": "miscellaneous", "misc": "miscellaneous",
+}
+
+TOPIC_CHOICES = ("all", "aws", "web", "windows", "linux", "active_directory",
+                 "blue_team", "guided_lab", "miscellaneous")
+
+
+def _topic_arg(value: str) -> str:
+    """argparse ``type`` for ``--topic``: normalise, then validate.
+
+    A plain ``choices=`` list would reject ``-T ad`` and ``-T "active
+    directory"``, which is what anyone coming from the website's chips
+    will reach for first.
+    """
+    key = (value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    try:
+        return _TOPIC_ALIASES[key]
+    except KeyError:
+        raise argparse.ArgumentTypeError(
+            f"unknown topic {value!r} — pick from: " + ", ".join(TOPIC_CHOICES))
+
+
 _CATEGORY_LABELS = {
     "challenge": "challenge",
     "guided": "guided",
@@ -395,17 +535,22 @@ def _render_labs_table(items: List[Dict[str, Any]], title: str = "Labs"):
     The name is stripped of its ``Challenge Lab:`` prefix and ``(Easy)``
     suffix — both are rendered in their own right (the suffix as the
     Difficulty column), and repeating them costs a third of the width in a
-    list where every prefix is identical. The Type column only appears when
-    the list actually spans categories, i.e. under ``-c all``.
+    list where every prefix is identical. The Type and Topic columns only
+    appear when the list actually spans more than one value, so a
+    ``--topic ad`` list doesn't waste a column repeating "AD".
     """
     cats = {_lab_category(_item_name(it)) for it in items}
     show_type = len(cats) > 1
+    topics = {_topic_label(it, short=True) for it in items}
+    show_topic = len(topics) > 1
     t = Table(title=title, title_justify="left", show_header=True,
               header_style="bold", border_style="dim")
     t.add_column("#", justify="right", style="dim")
     t.add_column("Lab")
     if show_type:
         t.add_column("Type", style="dim")
+    if show_topic:
+        t.add_column("Topic", style="cyan")
     t.add_column("Difficulty")
     t.add_column("Progress")
     for i, it in enumerate(items, 1):
@@ -413,6 +558,8 @@ def _render_labs_table(items: List[Dict[str, Any]], title: str = "Labs"):
         row: List[Any] = [str(i), truncate(lab_display_name(name), 48)]
         if show_type:
             row.append(_CATEGORY_LABELS.get(_lab_category(name), "—"))
+        if show_topic:
+            row.append(_topic_label(it, short=True))
         row += [
             _badge(_extract_difficulty(it), DIFFICULTY_STYLE),
             _badge(_extract_state(it), STATE_STYLE),
@@ -480,6 +627,14 @@ def cmd_labs_list(api: HackSmarterAPI, config: Config, args) -> int:
         items = [it for it in items
                  if (_extract_state(it) or "").lower() in wanted]
 
+    # The website's topic chips (AWS / Active Directory / …). Repeating the
+    # flag ORs, matching the page's own behaviour of one chip at a time but
+    # letting you ask for two in a single run.
+    topics = {t for t in getattr(args, "topic", []) or []}
+    if topics and "all" not in topics:
+        items = [it for it in items
+                 if any(_matches_topic(it, t) for t in topics)]
+
     cats = set(args.category) or set(DEFAULT_CATEGORIES)
     if "all" not in cats:
         items = [it for it in items
@@ -500,6 +655,12 @@ def cmd_labs_list(api: HackSmarterAPI, config: Config, args) -> int:
                 (_extract_state(it) or "~"),
                 _item_name(it).lower(),
             ))
+        elif args.sort == "topic":
+            # Untopiced labs sort last: "~" beats every label alphabetically.
+            items.sort(key=lambda it: (
+                _topic_label(it) if _lab_topics(it) else "~",
+                _item_name(it).lower(),
+            ))
 
     if fmt == "json":
         print_json(items if items else payload)
@@ -516,6 +677,8 @@ def cmd_labs_list(api: HackSmarterAPI, config: Config, args) -> int:
         print_warning("No labs match those filters.")
         steps(
             ("hsmcli labs list -c all", "include every category") if narrowed else None,
+            ("hsmcli labs list --topic all", "drop the topic filter")
+            if topics and "all" not in topics else None,
             ("hsmcli labs list", "clear the filters"),
         )
         return 0
@@ -523,6 +686,8 @@ def cmd_labs_list(api: HackSmarterAPI, config: Config, args) -> int:
     _render_labs_table(items)
     console.print()
     summary = f"{len(items)} lab{'s' if len(items) != 1 else ''}"
+    if topics and "all" not in topics:
+        summary += " · " + "/".join(TOPIC_LABELS[t] for t in sorted(topics))
     if narrowed:
         summary += " · challenge labs only"
     print_info(summary)
@@ -530,6 +695,8 @@ def cmd_labs_list(api: HackSmarterAPI, config: Config, args) -> int:
         ("hsmcli lab <name> info", "objective, flags and live status"),
         ("hsmcli labs list -c all", "every category, not just challenge labs")
         if narrowed else None,
+        ("hsmcli labs list -T ad -d hard", "filter by topic and difficulty")
+        if not topics and not args.difficulty else None,
     )
     return 0
 
@@ -790,6 +957,8 @@ def cmd_lab_info(api: HackSmarterAPI, config: Config, args) -> int:
     card.append(_badge(state or "—", STATE_STYLE))
     if category:
         card.append(f"  ·  {category.lower()}", style="dim")
+    if _lab_topics(body):
+        card.append(f"  ·  {_topic_label(body)}", style="cyan")
 
     runtime = body.get("included_runtime_gb_seconds")
     if runtime:
@@ -2522,7 +2691,12 @@ def build_parser() -> argparse.ArgumentParser:
                               "hackwith", "foundations", "other"],
                      help="filter by lab category (repeatable; "
                           "default: challenge, 'all' to widen)")
-    _ll.add_argument("--sort", choices=["name", "difficulty", "state"],
+    _ll.add_argument("-T", "--topic", action="append", default=[],
+                     type=_topic_arg, metavar="TOPIC",
+                     help="filter by subject, as on the website's catalog "
+                          "chips (repeatable): " + ", ".join(TOPIC_CHOICES)
+                          + " — 'ad' and 'web app' also work")
+    _ll.add_argument("--sort", choices=["name", "difficulty", "state", "topic"],
                      default=None, help="sort results")
     _add_format_flags(_ll)
 

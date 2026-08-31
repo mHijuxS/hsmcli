@@ -13,6 +13,10 @@ from hsmcli.cli import (
     _flatten_lab_items,
     _guess_image_ext,
     _lab_category,
+    _lab_topics,
+    _matches_topic,
+    _topic_arg,
+    _topic_label,
     _match_question,
     _parse_kv,
     _submission_verdict,
@@ -73,6 +77,98 @@ def test_extract_state_empty_when_unknown():
 ])
 def test_lab_category(name, want):
     assert _lab_category(name) == want
+
+
+# ── topics ────────────────────────────────────────────────────────────────
+# The website has no topic field either — it keyword-matches the subtitle
+# client-side. These cases are lifted from real catalog subtitles and were
+# diffed against the page's own bundle, so a regression here is a
+# divergence from what clicking the chip shows.
+
+@pytest.mark.parametrize("subtitle,want", [
+    ("This is a Medium AWS challenge lab.", ["aws"]),
+    ("This is a Medium Active Directory challenge lab. ", ["active_directory"]),
+    ("This is a Medium Web and Linux challenge lab. ", ["web", "linux"]),
+    ("This is a Hard Active Directory and Linux challenge lab.",
+     ["linux", "active_directory"]),          # site order, not subtitle order
+    ("This is a Medium Windows & Linux challenge lab. ", ["windows", "linux"]),
+    ("This is an Easy Blue Team challenge lab. ", ["blue_team"]),
+    ("This is a Medium Web App challenge lab. ", ["web"]),
+    ("This is an Easy Guided Lab. ", []),     # no subject named -> misc
+    ("This is an Easy challenge lab. ", []),
+    ("", []),
+])
+def test_lab_topics_match_the_sites_subtitle_keywords(subtitle, want):
+    assert _lab_topics({"subtitle": subtitle}) == want
+
+
+def test_lab_topics_read_the_courses_spelling_of_the_subtitle():
+    """/catalog says ``subtitle``; /courses says ``description``."""
+    assert _lab_topics({"description": "This is an Easy AWS challenge lab."}) \
+        == ["aws"]
+
+
+@pytest.mark.parametrize("subtitle", [
+    "Webhooks and you",        # 'web' must not match inside a longer word
+    "A course about awslogs",  # nor 'aws'
+])
+def test_lab_topics_respect_word_boundaries(subtitle):
+    assert _lab_topics({"subtitle": subtitle}) == []
+
+
+def test_miscellaneous_is_the_labs_with_no_topic():
+    misc = {"subtitle": "This is an Easy challenge lab."}
+    assert _matches_topic(misc, "miscellaneous")
+    assert not _matches_topic({"subtitle": "an Easy AWS lab"}, "miscellaneous")
+
+
+def test_guided_lab_is_matched_on_the_title_not_the_subtitle():
+    """The one chip the site keys off the title — "This is an Easy Guided
+    Lab." names no subject, so the subtitle can't carry it."""
+    item = {"name": "Guided Lab: Bloodhound (Easy)",
+            "subtitle": "This is an Easy Guided Lab."}
+    assert _matches_topic(item, "guided_lab")
+    assert not _matches_topic({"name": "Challenge Lab: Dark (Easy)",
+                               "subtitle": "This is an Easy Linux lab."},
+                              "guided_lab")
+
+
+def test_a_guided_lab_still_carries_its_own_topic():
+    item = {"name": "Guided Lab: IAM Enumeration (Easy)",
+            "subtitle": "This is an Easy AWS Guided Lab. "}
+    assert _matches_topic(item, "guided_lab")
+    assert _matches_topic(item, "aws")
+
+
+def test_topic_label_joins_multiple_topics():
+    it = {"subtitle": "This is a Medium Windows & Linux challenge lab."}
+    assert _topic_label(it) == "Windows/Linux"
+
+
+def test_topic_label_abbreviates_active_directory_for_the_table():
+    it = {"subtitle": "This is a Hard Active Directory challenge lab."}
+    assert _topic_label(it) == "Active Directory"
+    assert _topic_label(it, short=True) == "AD"
+
+
+@pytest.mark.parametrize("given,want", [
+    ("ad", "active_directory"),
+    ("AD", "active_directory"),
+    ("active directory", "active_directory"),
+    ("Active-Directory", "active_directory"),
+    ("web app", "web"),
+    ("misc", "miscellaneous"),
+    ("guided", "guided_lab"),
+    ("all", "all"),
+])
+def test_topic_arg_accepts_what_people_type(given, want):
+    assert _topic_arg(given) == want
+
+
+def test_topic_arg_rejects_an_unknown_topic():
+    import argparse
+    with pytest.raises(argparse.ArgumentTypeError):
+        _topic_arg("kubernetes")
 
 
 # ── systems / networks flattening ─────────────────────────────────────────

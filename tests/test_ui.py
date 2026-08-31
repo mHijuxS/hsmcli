@@ -270,6 +270,24 @@ def test_lab_table_strips_the_prefix_and_difficulty_from_the_name():
     assert "in progress" in out
 
 
+def test_lab_table_shows_the_topic_column_only_when_topics_differ():
+    mixed = _render(_render_labs_table, [
+        {"name": "Challenge Lab: Dark (Easy)",
+         "subtitle": "This is an Easy Linux challenge lab."},
+        {"name": "Challenge Lab: Mapper (Medium)",
+         "subtitle": "This is a Medium AWS challenge lab."},
+    ])
+    assert "Topic" in mixed and "Linux" in mixed and "AWS" in mixed
+
+    uniform = _render(_render_labs_table, [
+        {"name": "Challenge Lab: Odyssey (Hard)",
+         "subtitle": "This is a Hard Active Directory challenge lab."},
+        {"name": "Challenge Lab: Sysco (Medium)",
+         "subtitle": "This is a Medium Active Directory challenge lab."},
+    ])
+    assert "Topic" not in uniform
+
+
 @pytest.mark.parametrize("render,rows", [
     (_render_systems_table, []),
     (_render_labs_table, []),
