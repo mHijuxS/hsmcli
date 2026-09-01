@@ -36,6 +36,7 @@ dependencies = [
     "requests>=2.25.0",
     "PyYAML>=5.4.0",
     "rich>=13.0.0",
+    "websocket-client>=1.0.0",
 ]
 
 [project.optional-dependencies]

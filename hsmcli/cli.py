@@ -42,6 +42,13 @@ from .api_client import (
     detect_public_ip,
     parse_cookie_header,
 )
+from .browser_auth import (
+    BrowserCaptureCancelled,
+    BrowserCaptureUnavailable,
+    capture_browser_cookie,
+    capture_default_firefox_cookie,
+    capture_firefox_cookie,
+)
 from .config import Config
 from .resolvers import (
     _extract_items,
@@ -304,10 +311,10 @@ def cmd_config_reset(config: Config, args) -> int:
 # Signing in is a first-class act, not a configuration detail. The ideal —
 # a PKCE/device-code flow where the browser does the login and the CLI never
 # sees a password — needs an endpoint HackSmarter doesn't offer an unofficial
-# client, so until then: a *guided secure cookie import* — a hidden prompt
-# that keeps the pasted header out of shell history and process listings,
-# verified against the API before it replaces anything — plus a piped
-# fallback for scripts.
+# client. Instead, Chromium's loopback DevTools connection captures only the
+# resulting Supabase chunks. The hidden prompt remains as an SSH/no-browser
+# fallback, and every interactive candidate is verified before it replaces
+# anything.
 
 
 class _CandidateConfig:
@@ -329,12 +336,11 @@ class _CandidateConfig:
         return self._cookie
 
 def cmd_auth_login(config: Config, args) -> int:
-    """Guided secure cookie import — not an automatic browser login.
+    """Import an existing session or capture one after browser login.
 
-    The browser is opened and the paste is guided, hidden (``getpass``
-    keeps the token out of shell history, scrollback and ``ps``) and
-    verified before it replaces anything — but the user still copies the
-    Cookie header from devtools themselves.
+    Chromium exposes the isolated profile's cookie store over a random
+    loopback DevTools port; only the site's Supabase chunks are retained.
+    ``--no-browser`` retains the hidden manual prompt for SSH use.
 
     ``--github`` only changes the guidance to name the site's GitHub
     button; it does NOT start an OAuth flow. HackSmarter's GitHub login
@@ -343,8 +349,6 @@ def cmd_auth_login(config: Config, args) -> int:
     redirect HackSmarter would have to register for us; until then the
     browser does the OAuth dance and we import the session it produced.)
     """
-    import getpass
-
     if not sys.stdin.isatty():
         # getpass on a pipe half-works (reads stdin, warns on stderr) but
         # the explicit command says what it's doing.
@@ -352,33 +356,57 @@ def cmd_auth_login(config: Config, args) -> int:
                  "it directly (same as `hsmcli auth import-cookie -`).")
         return _store_cookie(config, sys.stdin.read())
 
+    import getpass
     site = config.get_base_url()
-    opened = False
-    if not getattr(args, "no_browser", False):
-        import webbrowser
-        try:
-            opened = webbrowser.open(site)
-        except Exception:
-            opened = False
-
     github = getattr(args, "github", False)
     how = ("sign in with the “Sign in with GitHub” button" if github
            else "sign in as usual (email, or the GitHub button)")
-    err_console.print(Text.assemble(
-        (("Opening " if opened else "Log in at "), ""),
-        (site, "cmd"),
-        (f"{' in your browser' if opened else ''} — {how}.\n", ""),
-        ("Then copy the Cookie header:\n", ""),
-        ("  devtools → Network → any request → Request Headers → Cookie\n",
-         "muted"),
-        ("\nThe pasted value is hidden and won't enter your shell history.",
-         "muted"),
-    ))
-    try:
-        cookie = getpass.getpass("Cookie: ")
-    except (EOFError, KeyboardInterrupt):
-        print_error("No cookie entered.")
-        return 1
+    if not getattr(args, "no_browser", False):
+        try:
+            cookie = capture_firefox_cookie(site)
+            if cookie:
+                info_err("Found an existing HackSmarter session in Firefox.")
+            else:
+                info_err("No existing Firefox session; opening your default "
+                         "browser if it supports automatic capture.")
+                cookie = capture_default_firefox_cookie(site)
+                if cookie:
+                    info_err("Captured the session from your default Firefox.")
+            if not cookie:
+                err_console.print(Text.assemble(
+                    ("Opening an isolated login window for ", ""),
+                    (site, "cmd"),
+                    (f" — {how}.\n", ""),
+                    ("The window will close automatically after sign-in.",
+                     "muted"),
+                ))
+                cookie = capture_browser_cookie(site)
+        except BrowserCaptureUnavailable as e:
+            print_warning(f"Automatic browser capture unavailable ({e}).")
+            cookie = ""
+        except BrowserCaptureCancelled as e:
+            print_error(str(e).capitalize() + ".")
+            return 1
+        except KeyboardInterrupt:
+            print_error("Login cancelled.")
+            return 130
+    else:
+        cookie = ""
+
+    if not cookie:
+        err_console.print(Text.assemble(
+            (f"Log in at {site} — {how}.\n", ""),
+            ("Then copy the Cookie header:\n", ""),
+            ("  devtools → Network → any request → Request Headers → Cookie\n",
+             "muted"),
+            ("\nThe pasted value is hidden and won't enter your shell history.",
+             "muted"),
+        ))
+        try:
+            cookie = getpass.getpass("Cookie: ")
+        except (EOFError, KeyboardInterrupt):
+            print_error("No cookie entered.")
+            return 1
     if not cookie.strip():
         print_error("No cookie entered.")
         return 1
@@ -398,7 +426,7 @@ def cmd_auth_login(config: Config, args) -> int:
         HackSmarterAPI(_CandidateConfig(site, cleaned)).get_profile()
     except AuthError:
         print_error("HackSmarter rejected that session — nothing was "
-                    "saved. Copy a fresh Cookie header and try again.")
+                    "saved. Sign in again and retry.")
         return 1
     except TransportError as e:
         print_warning(f"Couldn't reach the API to verify ({e}) — saving "
@@ -3072,16 +3100,16 @@ def build_parser() -> argparse.ArgumentParser:
     asub = pa.add_subparsers(dest="subcommand")
     _al = asub.add_parser(
         "login",
-        help="guided secure cookie import — opens the site, then a hidden "
-             "verified Cookie prompt (you still copy it from devtools)")
+        help="import an existing Firefox session, or open a browser and "
+             "capture one automatically after sign-in")
     _al.add_argument("--github", action="store_true",
                      help="point the guidance at the site's "
                           "Sign-in-with-GitHub button (does not start an "
                           "OAuth flow itself; the imported session is the "
                           "same either way)")
     _al.add_argument("--no-browser", action="store_true",
-                     help="don't open a browser (e.g. over SSH) — just show "
-                          "the instructions and prompt")
+                     help="don't launch a browser (e.g. over SSH) — use the "
+                          "hidden Cookie prompt instead")
     _ic = asub.add_parser(
         "import-cookie",
         help="save a Cookie header non-interactively ('-' or no argument "

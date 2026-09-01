@@ -28,7 +28,10 @@ HEADER = ("_ga=GA1.2.3; sb-auth-auth-token.0=part0; "
 
 
 @pytest.fixture
-def cfg(tmp_path):
+def cfg(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "capture_firefox_cookie", lambda site: None)
+    monkeypatch.setattr(cli, "capture_default_firefox_cookie",
+                        lambda site: None)
     return Config(str(tmp_path / "cfg"))
 
 
@@ -108,6 +111,53 @@ def test_login_hidden_prompt_saves_and_verifies(cfg, monkeypatch, capsys):
     assert "part0" not in out.out + out.err
 
 
+def test_login_captures_cookie_from_browser_automatically(cfg, monkeypatch,
+                                                          capsys):
+    monkeypatch.setattr("sys.stdin", io.StringIO(""))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True, raising=False)
+    monkeypatch.setattr(cli, "capture_browser_cookie", lambda site: HEADER)
+    monkeypatch.setattr(cli, "HackSmarterAPI", _OkAPI)
+
+    assert cmd_auth_login(cfg, _args(no_browser=False)) == 0
+    assert cfg.get_cookie() == ("sb-auth-auth-token.0=part0; "
+                                "sb-auth-auth-token.1=part1")
+    output = capsys.readouterr()
+    assert "isolated login window" in output.err
+    assert "Cookie:" not in output.out + output.err
+
+
+def test_login_imports_existing_firefox_session_without_opening_window(
+        cfg, monkeypatch, capsys):
+    monkeypatch.setattr("sys.stdin", io.StringIO(""))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True, raising=False)
+    monkeypatch.setattr(cli, "capture_firefox_cookie", lambda site: HEADER)
+    monkeypatch.setattr(
+        cli, "capture_browser_cookie",
+        lambda site: pytest.fail("should not launch Chromium"),
+    )
+    monkeypatch.setattr(cli, "HackSmarterAPI", _OkAPI)
+
+    assert cmd_auth_login(cfg, _args(no_browser=False)) == 0
+    assert cfg.get_cookie().startswith("sb-auth-auth-token.0=")
+    assert "existing HackSmarter session in Firefox" in capsys.readouterr().err
+
+
+def test_login_captures_login_from_default_firefox(cfg, monkeypatch, capsys):
+    monkeypatch.setattr("sys.stdin", io.StringIO(""))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True, raising=False)
+    monkeypatch.setattr(cli, "capture_default_firefox_cookie",
+                        lambda site: HEADER)
+    monkeypatch.setattr(
+        cli, "capture_browser_cookie",
+        lambda site: pytest.fail("should not launch isolated Chromium"),
+    )
+    monkeypatch.setattr(cli, "HackSmarterAPI", _OkAPI)
+
+    assert cmd_auth_login(cfg, _args(no_browser=False)) == 0
+    assert cfg.get_cookie().startswith("sb-auth-auth-token.0=")
+    assert "default Firefox" in capsys.readouterr().err
+
+
 def test_login_rejected_session_saves_nothing(cfg, monkeypatch, capsys):
     """A bad paste must not clobber a stored session that still works,
     and no ✓ may appear before the verdict."""
@@ -140,11 +190,10 @@ def test_login_verifies_the_candidate_not_the_env_cookie(cfg, monkeypatch):
     assert seen["cookie"].startswith("sb-auth-auth-token.0=part0")
 
 
-def test_login_github_opens_browser_and_names_the_button(cfg, monkeypatch,
-                                                         capsys):
+def test_login_github_capture_names_the_button(cfg, monkeypatch, capsys):
     opened = {}
-    monkeypatch.setattr("webbrowser.open",
-                        lambda url: opened.setdefault("url", url) or True)
+    monkeypatch.setattr(cli, "capture_browser_cookie",
+                        lambda url: opened.setdefault("url", url) and HEADER)
     monkeypatch.setattr("sys.stdin", io.StringIO(""))
     monkeypatch.setattr("sys.stdin.isatty", lambda: True, raising=False)
     monkeypatch.setattr("getpass.getpass", lambda prompt: HEADER)

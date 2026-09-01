@@ -9,15 +9,16 @@ All notable changes to this project. Format loosely follows
 ### Added
 
 - **`hsmcli auth` — signing in is a first-class command, not a config
-  key.** `auth login` is a *guided secure cookie import*: it opens the
-  browser at HackSmarter (sign in with email or the GitHub button —
-  `--github` points the guidance at it without starting an OAuth flow;
-  the imported session is identical), then takes the `Cookie:` header
-  behind a *hidden* prompt, so the token stays out of shell history,
-  scrollback and `ps`. Only the Supabase auth chunks
+  key.** `auth login` first imports an existing HackSmarter session from a
+  Firefox profile through a temporary SQLite/WAL snapshot. If Firefox is the
+  default and no session exists, it opens that normal profile and watches for
+  login. Otherwise it prefers the default Chromium-family browser in an
+  isolated window and captures through DevTools on loopback, with no extension.
+  The window closes and its profile is deleted after capture; `--no-browser`
+  retains the hidden Cookie prompt for SSH. Only the Supabase auth chunks
   (`sb-auth-auth-token.N`, matched exactly) are stored — a header without
   them is rejected, and the candidate is verified against the API *before*
-  it replaces the stored session, so a bad paste can't clobber a working
+  it replaces the stored session, so a bad login can't clobber a working
   login. hsmcli does not refresh the token; renewal is re-running
   `auth login`. `auth import-cookie -` is the
   piped fallback for scripts and secret managers; `auth status` reports

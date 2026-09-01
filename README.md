@@ -22,12 +22,13 @@ pip install .            # or, into the current environment
 
 It also runs uninstalled from a checkout: `python -m hsmcli`.
 
-Requires Python 3.9+ and `requests`, `PyYAML`, `rich`. CI covers 3.9–3.14.
+Requires Python 3.9+ and `requests`, `PyYAML`, `rich`, `websocket-client`.
+CI covers 3.9–3.14.
 
 ## Quickstart
 
 ```bash
-hsmcli auth login                    # import your browser session
+hsmcli auth login                    # sign in; the session is captured automatically
 hsmcli labs list                     # see what's on the account
 hsmcli lab dark launch               # boot it, wait, print the IP
 hsmcli lab dark vpn                  # ./dark.ovpn, mode 0600
@@ -38,21 +39,26 @@ hsmcli lab dark stop
 
 ## Auth
 
-`hsmcli auth login` is a guided cookie import, not a login flow. It opens
-HackSmarter in your browser; you sign in as usual (email or the GitHub
-button), then copy the `Cookie:` header from devtools → Network → any
-request → Request Headers, and paste it at the prompt.
+`hsmcli auth login` first looks for an existing signed-in Firefox profile and
+imports its HackSmarter session immediately. If Firefox is the default but no
+session exists yet, it opens the normal default profile and watches for login.
+Otherwise it opens an isolated window in the default Chromium-family browser
+(or another installed Chromium browser); sign in as usual and hsmcli captures
+the session, closes the window, and deletes its temporary profile.
 
-- The prompt is hidden, so the token never reaches your shell history,
-  scrollback or `ps`.
+- Cookie capture uses Chromium's built-in DevTools connection, bound to a
+  random port on `127.0.0.1`; no extension is installed.
+- Firefox import queries a temporary SQLite/WAL snapshot and works while
+  Firefox is open. Set `HSMCLI_FIREFOX_PROFILE` only when profile
+  auto-detection misses a nonstandard location.
 - Only the Supabase auth chunks (`sb-auth-auth-token.N`) are kept. A header
   without them is rejected and nothing is written.
-- The paste is verified against the API before it replaces the stored
-  session, so a bad paste can't clobber a working one.
+- The captured session is verified against the API before it replaces the
+  stored session, so a bad login can't clobber a working one.
 
-`--github` points the instructions at the GitHub button; it does not start
-an OAuth flow, and the imported session is identical either way.
-`--no-browser` skips opening a browser, for use over SSH.
+`--github` points the instructions at the GitHub button; the imported session
+is identical either way. `--no-browser` keeps the hidden manual Cookie prompt
+as a fallback for SSH or machines without a supported browser.
 
 There is no official CLI auth endpoint, so a PKCE or device-code flow isn't
 available to an unofficial client. The browser handles login, OAuth and
