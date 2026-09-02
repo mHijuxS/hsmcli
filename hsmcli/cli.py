@@ -2458,6 +2458,25 @@ def _render_flags_table(items: List[Dict[str, Any]], title: str = "Flags"):
     console.print(t)
 
 
+def _take_is_complete(take: Dict[str, Any]) -> bool:
+    """Whether /take already says the playthrough is marked complete.
+
+    Solving every flag doesn't finish a lab — the lessons still need the
+    `complete` POST — so this is what decides whether the finish-line hint
+    should be "complete" or "certificate".
+    """
+    body = take.get("course", take) if isinstance(take, dict) else {}
+    pt = body.get("course_playthrough") if isinstance(body, dict) else None
+    return bool((pt or {}).get("is_complete"))
+
+
+def _finish_line_step(take: Dict[str, Any], args) -> Tuple[str, str]:
+    """The next command once every flag is in: `complete`, then the PDF."""
+    if _take_is_complete(take):
+        return (_lab_cmd(args, "certificate"), "download the PDF")
+    return (_lab_cmd(args, "complete"), "mark the lab complete")
+
+
 def cmd_lab_flags(api: HackSmarterAPI, config: Config, args) -> int:
     fmt = _format_choice(args, config)
     course_id, label = _resolve_lab(api, args)
@@ -2488,6 +2507,9 @@ def cmd_lab_flags(api: HackSmarterAPI, config: Config, args) -> int:
         # a prompt substring, and "user"/"root" is how the flags are named.
         hint = _flag_selector(unsolved[0], questions)
         steps((_lab_cmd(args, f"submit {hint} '<flag>'"), "submit an answer"))
+    else:
+        steps(_finish_line_step(take, args),
+              (_lab_cmd(args, "stop"), "power the machine off"))
     return 0
 
 
@@ -2651,8 +2673,11 @@ def cmd_lab_submit(api: HackSmarterAPI, config: Config, args) -> int:
             steps((_lab_cmd(args, f"submit {_flag_selector(remaining[0], questions)} "
                                   f"'<flag>'"), "next one"))
         else:
-            print_success(f"{label} complete — every flag submitted.")
-            steps((_lab_cmd(args, "stop"), "power the machine off"))
+            # Every flag in, but the lab isn't *finished* until its lessons
+            # are marked complete — that POST is what mints the certificate.
+            print_success(f"Every flag submitted — {label} is solved.")
+            steps(_finish_line_step(take, args),
+                  (_lab_cmd(args, "stop"), "power the machine off"))
     else:
         print_error(f"Not the flag — {prompt_short}")
         # Server sometimes echoes hints or attempt counters, flat or nested.

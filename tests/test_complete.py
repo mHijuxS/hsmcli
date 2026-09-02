@@ -319,3 +319,70 @@ def test_certificate_command_json_carries_both_urls(cfg, capsys):
     out = capsys.readouterr().out
     assert COMPLETION_ID in out
     assert "completion_url" in out and "download_url" in out
+
+
+# ── the finish line: what `submit` points at once the last flag lands ─────
+# Solving every flag does NOT finish a lab — the lessons still need the
+# `complete` POST, and that POST is what mints the certificate. So the hint
+# after the last flag has to name `complete`, not just `stop`.
+
+class SubmitAPI(CompleteAPI):
+    """CompleteAPI plus the question surface `lab submit` touches."""
+
+    def __init__(self, questions, is_complete=False, **kw):
+        super().__init__(is_complete=is_complete, **kw)
+        self._questions = questions
+        self._take_payload = _take(is_complete=is_complete)
+
+    def get_course_take(self, course_id, use_cache=False):
+        return self._take_payload
+
+    def extract_questions(self, take):
+        return self._questions
+
+    def submit_question(self, course_id, lesson_id, question_id, submission):
+        return {"is_correct": True}
+
+
+def _questions(solved_first=True):
+    return [
+        {"lesson_id": LESSON_A, "question_id": "q1",
+         "prompt": "What is the user flag?",
+         "state": "correct" if solved_first else "unanswered"},
+        {"lesson_id": LESSON_A, "question_id": "q2",
+         "prompt": "What is the root flag?", "state": "unanswered"},
+    ]
+
+
+def _submit_args(selector, value="deadbeef"):
+    return _args("widget", selector=selector, value=value, force=False)
+
+
+def test_last_flag_points_at_complete_before_stop(cfg, capsys):
+    from hsmcli.cli import cmd_lab_submit
+    api = SubmitAPI(_questions())
+    assert cmd_lab_submit(api, cfg, _submit_args("root")) == 0
+    out = capsys.readouterr().out
+    assert "hsmcli lab widget complete" in out
+    # ...and still offers the power-off, after it.
+    assert out.index("widget complete") < out.index("widget stop")
+
+
+def test_last_flag_points_at_the_certificate_when_already_complete(cfg, capsys):
+    """Lessons already ticked (a --force resubmit, say) — `complete` would
+    be a no-op, so the hint jumps to the PDF."""
+    from hsmcli.cli import cmd_lab_submit
+    api = SubmitAPI(_questions(), is_complete=True)
+    assert cmd_lab_submit(api, cfg, _submit_args("root")) == 0
+    out = capsys.readouterr().out
+    assert "hsmcli lab widget certificate" in out
+    assert "hsmcli lab widget complete" not in out
+
+
+def test_a_middle_flag_still_points_at_the_next_one(cfg, capsys):
+    from hsmcli.cli import cmd_lab_submit
+    api = SubmitAPI(_questions(solved_first=False))
+    assert cmd_lab_submit(api, cfg, _submit_args("user")) == 0
+    out = capsys.readouterr().out
+    assert "submit root" in out
+    assert "complete" not in out
